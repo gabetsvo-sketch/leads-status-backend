@@ -390,6 +390,14 @@ async def internal_news(
             "status": "pending",
             "approved_message": None,
             "decided_at": None,
+            # Различаем источник: parser (RSS/HTML) vs infopovod_rustem (банк РОПа)
+            "kind": new_item.get("kind", "parser"),
+            # Дополнительные поля Рустема (только для kind=infopovod_rustem)
+            "rustem_for_whom": new_item.get("rustem_for_whom"),
+            "rustem_was_in_phuket": new_item.get("rustem_was_in_phuket"),
+            "rustem_pressure": new_item.get("rustem_pressure"),
+            "rustem_type": new_item.get("rustem_type"),
+            "rustem_bank": new_item.get("rustem_bank"),
         }
         news_inbox.insert(0, entry)
         added += 1
@@ -405,14 +413,17 @@ async def internal_news(
 @app.get("/api/news")
 async def list_news(
     status: str = Query("pending", pattern="^(pending|approved|rejected|all)$"),
-    limit: int = Query(50, ge=1, le=200),
+    kind: str = Query("all", pattern="^(parser|infopovod_rustem|all)$"),
+    limit: int = Query(200, ge=1, le=500),
     authorization: Optional[str] = Header(default=None),
 ):
-    """iOS GET'ит — список новостей по статусу."""
+    """iOS GET'ит — список новостей по статусу + типу источника."""
     check_token(authorization)
     items = news_inbox
     if status != "all":
         items = [n for n in items if n.get("status") == status]
+    if kind != "all":
+        items = [n for n in items if n.get("kind", "parser") == kind]
     return {
         "count": len(items),
         "updated_at": items[0].get("received_at") if items else None,
