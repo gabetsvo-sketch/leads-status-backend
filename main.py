@@ -30,6 +30,7 @@ SESSION_STRING = os.environ.get("TG_SESSION_STRING", "").strip()
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 LEADS_FILE = Path(os.environ.get("LEADS_FILE", "leads.json"))
 LEADS_RETENTION = int(os.environ.get("LEADS_RETENTION", "200"))  # сколько лидов хранить в памяти
+TASKS_FILE = Path(os.environ.get("TASKS_FILE", "tasks_today.json"))
 
 RED_EMOJIS = set("🔴🟥🛑⛔🚫🚩🔻")
 GREEN_EMOJIS = set("🟢🟩✅🔺")
@@ -76,8 +77,22 @@ def save_leads(items: list) -> None:
     LEADS_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2))
 
 
+def load_tasks() -> dict:
+    if TASKS_FILE.exists():
+        try:
+            return json.loads(TASKS_FILE.read_text())
+        except Exception:
+            log.exception("failed to load tasks, starting fresh")
+    return {"updated_at": None, "tasks": []}
+
+
+def save_tasks(payload: dict) -> None:
+    TASKS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 state = load_state()
 leads_inbox: list = load_leads()  # most-recent-first
+tasks_today: dict = load_tasks()  # {"updated_at": iso, "tasks": [...]}
 client: Optional[TelegramClient] = None
 
 
@@ -275,6 +290,46 @@ async def ack_lead(
             save_leads(leads_inbox)
             return {"status": "ok", "lead_id": lead_id}
     raise HTTPException(status_code=404, detail="lead not found")
+
+
+# ---------------------------------------------------------------------------
+# Today's tasks (push from Mac assistant scheduler, GET from iOS)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/internal/tasks")
+async def internal_tasks(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac assistant пушит сегодняшний список задач (полностью заменяет).
+
+    Payload: {"tasks": [{"task_id": int, "lead_id": int, "due": iso, ...}, ...]}
+    """
+    check_internal(authorization)
+    tasks = payload.get("tasks") or []
+    if not isinstance(tasks, list):
+        raise HTTPException(status_code=400, detail="'tasks' must be a list")
+
+    global tasks_today
+    tasks_today = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "tasks": tasks,
+    }
+    save_tasks(tasks_today)
+    log.info(f"tasks_today updated: {len(tasks)} items")
+    return {"status": "ok", "count": len(tasks)}
+
+
+@app.get("/api/tasks/today")
+async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
+    """iOS GET'ит сегодняшний список задач."""
+    check_token(authorization)
+    return {
+        "count": len(tasks_today.get("tasks") or []),
+        "updated_at": tasks_today.get("updated_at"),
+        "tasks": tasks_today.get("tasks") or [],
+    }
 
 
 if __name__ == "__main__":
