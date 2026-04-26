@@ -31,6 +31,7 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 LEADS_FILE = Path(os.environ.get("LEADS_FILE", "leads.json"))
 LEADS_RETENTION = int(os.environ.get("LEADS_RETENTION", "200"))  # сколько лидов хранить в памяти
 TASKS_FILE = Path(os.environ.get("TASKS_FILE", "tasks_today.json"))
+NEWS_FILE = Path(os.environ.get("NEWS_FILE", "news.json"))
 
 RED_EMOJIS = set("🔴🟥🛑⛔🚫🚩🔻")
 GREEN_EMOJIS = set("🟢🟩✅🔺")
@@ -90,9 +91,23 @@ def save_tasks(payload: dict) -> None:
     TASKS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def load_news() -> list:
+    if NEWS_FILE.exists():
+        try:
+            return json.loads(NEWS_FILE.read_text())
+        except Exception:
+            log.exception("failed to load news, starting fresh")
+    return []
+
+
+def save_news(items: list) -> None:
+    NEWS_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2))
+
+
 state = load_state()
 leads_inbox: list = load_leads()  # most-recent-first
 tasks_today: dict = load_tasks()  # {"updated_at": iso, "tasks": [...]}
+news_inbox: list = load_news()    # [{id, url, title, ..., status}, ...]
 client: Optional[TelegramClient] = None
 
 
@@ -330,6 +345,119 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
         "updated_at": tasks_today.get("updated_at"),
         "tasks": tasks_today.get("tasks") or [],
     }
+
+
+# ---------------------------------------------------------------------------
+# News inbox: парсер пушит, iOS approve/reject
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/internal/news")
+async def internal_news(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Парсер пушит batch новостей. Дедуп по id (хеш URL'а).
+
+    Payload: {"items": [{"id": str, "url": str, "title": str, "title_ru": str,
+                          "summary_ru": str, "one_liner_ru": str, "source": str,
+                          "category": str, "score": int, "published_at": str?}, ...]}
+    """
+    check_internal(authorization)
+    items = payload.get("items") or []
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="'items' must be a list")
+
+    added = 0
+    for new_item in items:
+        nid = new_item.get("id")
+        if not nid:
+            continue
+        if any(n.get("id") == nid for n in news_inbox):
+            continue  # dedup
+        entry = {
+            "id": nid,
+            "url": new_item.get("url", ""),
+            "source": new_item.get("source", ""),
+            "title": new_item.get("title", ""),
+            "title_ru": new_item.get("title_ru", ""),
+            "summary_ru": new_item.get("summary_ru", ""),
+            "one_liner_ru": new_item.get("one_liner_ru", ""),
+            "category": new_item.get("category", "other"),
+            "score": int(new_item.get("score", 0) or 0),
+            "published_at": new_item.get("published_at"),
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "status": "pending",
+            "approved_message": None,
+            "decided_at": None,
+        }
+        news_inbox.insert(0, entry)
+        added += 1
+
+    # Trim — keep last 500
+    while len(news_inbox) > 500:
+        news_inbox.pop()
+    save_news(news_inbox)
+    log.info(f"news: добавлено {added} новых, всего в inbox: {len(news_inbox)}")
+    return {"status": "ok", "added": added, "total": len(news_inbox)}
+
+
+@app.get("/api/news")
+async def list_news(
+    status: str = Query("pending", pattern="^(pending|approved|rejected|all)$"),
+    limit: int = Query(50, ge=1, le=200),
+    authorization: Optional[str] = Header(default=None),
+):
+    """iOS GET'ит — список новостей по статусу."""
+    check_token(authorization)
+    items = news_inbox
+    if status != "all":
+        items = [n for n in items if n.get("status") == status]
+    return {
+        "count": len(items),
+        "updated_at": items[0].get("received_at") if items else None,
+        "news": items[:limit],
+    }
+
+
+@app.post("/api/news/{news_id}/approve")
+async def approve_news(
+    news_id: str,
+    payload: Optional[dict] = Body(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Одобрить инфоповод. payload может содержать {"message": "..."} —
+    финальную версию редактированного сообщения для клиента."""
+    check_token(authorization)
+    for n in news_inbox:
+        if n.get("id") == news_id:
+            n["status"] = "approved"
+            n["decided_at"] = datetime.now(timezone.utc).isoformat()
+            if payload and isinstance(payload, dict):
+                msg = payload.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    n["approved_message"] = msg.strip()
+            save_news(news_inbox)
+            log.info(f"news {news_id}: approved")
+            return {"status": "ok", "news_id": news_id}
+    raise HTTPException(status_code=404, detail="news not found")
+
+
+@app.post("/api/news/{news_id}/reject")
+async def reject_news(
+    news_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Отклонить инфоповод."""
+    check_token(authorization)
+    for n in news_inbox:
+        if n.get("id") == news_id:
+            n["status"] = "rejected"
+            n["decided_at"] = datetime.now(timezone.utc).isoformat()
+            save_news(news_inbox)
+            log.info(f"news {news_id}: rejected")
+            return {"status": "ok", "news_id": news_id}
+    raise HTTPException(status_code=404, detail="news not found")
 
 
 if __name__ == "__main__":
