@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: leads-status
+    runtime: python
+    plan: free
+    region: singapore
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: TG_CHAT_ID
+        sync: false
+      - key: WIDGET_TOKEN
+        sync: false
+      - key: TG_SESSION_STRING
+        sync: false

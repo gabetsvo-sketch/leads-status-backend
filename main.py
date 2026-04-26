@@ -10,6 +10,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
 load_dotenv()
 
@@ -24,6 +25,7 @@ API_HASH = os.environ["TG_API_HASH"]
 CHAT_ID = int(os.environ["TG_CHAT_ID"])
 WIDGET_TOKEN = os.environ["WIDGET_TOKEN"]
 SESSION_NAME = os.environ.get("SESSION_NAME", "leads_status")
+SESSION_STRING = os.environ.get("TG_SESSION_STRING", "").strip()
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
 RED_EMOJIS = set("🔴🟥🛑⛔🚫🚩🔻")
@@ -90,16 +92,20 @@ async def on_new_message(event):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client
-    log.info("lifespan: creating telethon client")
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    if SESSION_STRING:
+        log.info("lifespan: using StringSession from env (Render mode)")
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    else:
+        log.info("lifespan: using file session %r (local mode)", SESSION_NAME)
+        client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     log.info("lifespan: connecting")
     await client.connect()
     log.info("lifespan: connected, checking auth")
     if not await client.is_user_authorized():
         raise RuntimeError(
             "Telethon session is not authorized. "
-            "Run `python3 list_chats.py` locally once to sign in, "
-            "then start the server."
+            "Locally: run `python3 list_chats.py` to sign in. "
+            "On Render: set TG_SESSION_STRING env var (run migrate_session.py to generate)."
         )
     me = await client.get_me()
     log.info("telethon signed in as %s (id=%s)", me.username or me.first_name, me.id)
