@@ -347,6 +347,66 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
     }
 
 
+@app.post("/api/tasks/{task_id}/feedback")
+async def task_feedback(
+    task_id: int,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Vladimir пишет feedback на рекомендацию агента — сохраняется на disk
+    в /var/data/task_feedback.jsonl и потом подтягивается агентом для обучения."""
+    check_token(authorization)
+    feedback = (payload.get("feedback") or "").strip()
+    if not feedback:
+        raise HTTPException(status_code=400, detail="feedback empty")
+
+    # Найти задачу для контекста
+    task_meta = None
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            task_meta = t
+            break
+
+    entry = {
+        "task_id": task_id,
+        "lead_id": (task_meta or {}).get("lead_id"),
+        "lead_name": (task_meta or {}).get("lead_name"),
+        "task_text": (task_meta or {}).get("task_text"),
+        "stage": (task_meta or {}).get("stage"),
+        "rationale_at_feedback": (task_meta or {}).get("rationale"),
+        "suggested_message_at_feedback": (task_meta or {}).get("suggested_message"),
+        "feedback": feedback,
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # JSONL: одна задача = одна строка, append-only
+    fb_file = Path(os.environ.get("FEEDBACK_FILE", "/var/data/task_feedback.jsonl"))
+    fb_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(fb_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    log.info(f"feedback saved for task#{task_id}: {len(feedback)} chars")
+    return {"status": "ok", "task_id": task_id}
+
+
+@app.get("/api/internal/feedback/recent")
+async def list_recent_feedback(
+    limit: int = Query(20, ge=1, le=200),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac scheduler GET'ит последние feedback'и для использования в next генерации."""
+    check_internal(authorization)
+    fb_file = Path(os.environ.get("FEEDBACK_FILE", "/var/data/task_feedback.jsonl"))
+    if not fb_file.exists():
+        return {"count": 0, "feedback": []}
+    try:
+        lines = fb_file.read_text(encoding="utf-8").strip().splitlines()[-limit:]
+        items = [json.loads(ln) for ln in lines if ln.strip()]
+        return {"count": len(items), "feedback": items}
+    except Exception as e:
+        log.error(f"feedback read failed: {e}")
+        return {"count": 0, "feedback": []}
+
+
 # ---------------------------------------------------------------------------
 # News inbox: парсер пушит, iOS approve/reject
 # ---------------------------------------------------------------------------
