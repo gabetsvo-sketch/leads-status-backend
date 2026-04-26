@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Body, FastAPI, Header, HTTPException, Query
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -24,9 +24,12 @@ API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 CHAT_ID = int(os.environ["TG_CHAT_ID"])
 WIDGET_TOKEN = os.environ["WIDGET_TOKEN"]
+INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "").strip()  # для Mac assistant → Render
 SESSION_NAME = os.environ.get("SESSION_NAME", "leads_status")
 SESSION_STRING = os.environ.get("TG_SESSION_STRING", "").strip()
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
+LEADS_FILE = Path(os.environ.get("LEADS_FILE", "leads.json"))
+LEADS_RETENTION = int(os.environ.get("LEADS_RETENTION", "200"))  # сколько лидов хранить в памяти
 
 RED_EMOJIS = set("🔴🟥🛑⛔🚫🚩🔻")
 GREEN_EMOJIS = set("🟢🟩✅🔺")
@@ -60,7 +63,21 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
 
 
+def load_leads() -> list:
+    if LEADS_FILE.exists():
+        try:
+            return json.loads(LEADS_FILE.read_text())
+        except Exception:
+            log.exception("failed to load leads, starting fresh")
+    return []
+
+
+def save_leads(items: list) -> None:
+    LEADS_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2))
+
+
 state = load_state()
+leads_inbox: list = load_leads()  # most-recent-first
 client: Optional[TelegramClient] = None
 
 
@@ -130,6 +147,13 @@ def check_token(authorization: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+def check_internal(authorization: Optional[str]) -> None:
+    if not INTERNAL_TOKEN:
+        raise HTTPException(status_code=503, detail="INTERNAL_TOKEN not configured")
+    if authorization != f"Bearer {INTERNAL_TOKEN}":
+        raise HTTPException(status_code=401, detail="unauthorized (internal)")
+
+
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -158,6 +182,99 @@ async def send(
     save_state(state)
     log.info("sent %s as message %s; state updated", color, msg.id)
     return {"sent": color, "emoji": emoji}
+
+
+# ---------------------------------------------------------------------------
+# AmoCRM-leads inbox
+# Mac assistant scheduler детектит новые лиды (имея cookie через Chromium CDP)
+# и POST'ит сюда. iOS app/widget GET'ит /api/leads. Telethon DM'ит Vladimir'у.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/internal/lead")
+async def internal_lead(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Принять новый лид от Mac assistant. Auth: Bearer INTERNAL_TOKEN."""
+    check_internal(authorization)
+
+    lead_id = payload.get("lead_id")
+    if not lead_id:
+        raise HTTPException(status_code=400, detail="lead_id required")
+
+    # Дедуп по lead_id
+    if any(L.get("lead_id") == lead_id for L in leads_inbox):
+        log.info(f"lead #{lead_id} already in inbox — skipping")
+        return {"status": "duplicate", "lead_id": lead_id}
+
+    received_at = datetime.now(timezone.utc).isoformat()
+    entry = {
+        "lead_id": lead_id,
+        "name": payload.get("name", ""),
+        "phone": payload.get("phone", ""),
+        "source": payload.get("source", ""),
+        "stage": payload.get("stage", ""),
+        "pipeline": payload.get("pipeline", ""),
+        "amocrm_url": payload.get("amocrm_url", f"https://realdreamthai.amocrm.ru/leads/detail/{lead_id}"),
+        "created_at": payload.get("created_at", ""),
+        "received_at": received_at,
+        "acked": False,  # iOS отметит после показа; assistant — после записи в vault
+    }
+    leads_inbox.insert(0, entry)
+    # Trim
+    while len(leads_inbox) > LEADS_RETENTION:
+        leads_inbox.pop()
+    save_leads(leads_inbox)
+    log.info(f"new lead #{lead_id} {entry['name']!r} from {entry['source']!r}")
+
+    # Telegram DM в Saved Messages
+    try:
+        msg = (
+            f"🆕 Новый лид #{lead_id}\n"
+            f"👤 {entry['name'] or '(имя не указано)'}\n"
+            f"📞 {entry['phone'] or '—'}\n"
+            f"📍 {entry['source'] or '—'} · {entry['stage'] or ''}\n"
+            f"🔗 {entry['amocrm_url']}"
+        )
+        await client.send_message("me", msg)
+    except Exception as e:
+        log.warning(f"Telegram notify failed: {e}")
+
+    return {"status": "ok", "lead_id": lead_id, "inbox_size": len(leads_inbox)}
+
+
+@app.get("/api/leads")
+async def list_leads(
+    limit: int = Query(50, ge=1, le=200),
+    only_unacked: bool = Query(False),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Список последних лидов для iOS / assistant scheduler."""
+    check_token(authorization)
+    items = leads_inbox
+    if only_unacked:
+        items = [L for L in items if not L.get("acked")]
+    return {
+        "count": len(items),
+        "leads": items[:limit],
+    }
+
+
+@app.post("/api/leads/{lead_id}/ack")
+async def ack_lead(
+    lead_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Пометить лид как обработанный (iOS показал / assistant записал в vault)."""
+    check_token(authorization)
+    for L in leads_inbox:
+        if L.get("lead_id") == lead_id:
+            L["acked"] = True
+            L["acked_at"] = datetime.now(timezone.utc).isoformat()
+            save_leads(leads_inbox)
+            return {"status": "ok", "lead_id": lead_id}
+    raise HTTPException(status_code=404, detail="lead not found")
 
 
 if __name__ == "__main__":
