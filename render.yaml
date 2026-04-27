@@ -21,3 +21,5 @@ services:
         sync: false
       - key: TG_SESSION_STRING
         sync: false
+      - key: INTERNAL_TOKEN
+        sync: false

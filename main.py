@@ -556,6 +556,8 @@ async def internal_news(
             "decided_at": None,
             # Различаем источник: parser (RSS/HTML) vs infopovod_rustem (банк РОПа)
             "kind": new_item.get("kind", "parser"),
+            # Метакластер инфоповода (taxonomy 12 кластеров — см. infopovod-classification.md)
+            "cluster_id": new_item.get("cluster_id"),
             # Дополнительные поля Рустема (только для kind=infopovod_rustem)
             "rustem_for_whom": new_item.get("rustem_for_whom"),
             "rustem_was_in_phuket": new_item.get("rustem_was_in_phuket"),
@@ -578,21 +580,48 @@ async def internal_news(
 async def list_news(
     status: str = Query("pending", pattern="^(pending|approved|rejected|all)$"),
     kind: str = Query("all", pattern="^(parser|infopovod_rustem|all)$"),
+    cluster_id: Optional[str] = Query(default=None),
     limit: int = Query(200, ge=1, le=500),
     authorization: Optional[str] = Header(default=None),
 ):
-    """iOS GET'ит — список новостей по статусу + типу источника."""
+    """iOS GET'ит — список новостей по статусу + типу источника + кластеру."""
     check_token(authorization)
     items = news_inbox
     if status != "all":
         items = [n for n in items if n.get("status") == status]
     if kind != "all":
         items = [n for n in items if n.get("kind", "parser") == kind]
+    if cluster_id:
+        items = [n for n in items if n.get("cluster_id") == cluster_id]
     return {
         "count": len(items),
         "updated_at": items[0].get("received_at") if items else None,
         "news": items[:limit],
     }
+
+
+@app.post("/api/internal/news/backfill_clusters")
+async def backfill_clusters(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """One-time backfill: payload {by_news_id: {nid: cluster_id, ...}}.
+
+    Применяет cluster_id к существующим items в news_inbox. Для items, которые
+    раньше пришли без cluster_id."""
+    check_internal(authorization)
+    mapping = payload.get("by_news_id") or {}
+    if not isinstance(mapping, dict):
+        raise HTTPException(status_code=400, detail="by_news_id must be dict")
+    updated = 0
+    for n in news_inbox:
+        cid = mapping.get(n.get("id"))
+        if cid and n.get("cluster_id") != cid:
+            n["cluster_id"] = cid
+            updated += 1
+    save_news(news_inbox)
+    log.info(f"backfill_clusters: updated {updated}/{len(news_inbox)} items")
+    return {"status": "ok", "updated": updated, "total": len(news_inbox)}
 
 
 @app.post("/api/news/{news_id}/approve")
