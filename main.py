@@ -512,6 +512,93 @@ async def list_tasks_needs_regen(
     return {"count": len(items), "tasks": items}
 
 
+@app.post("/api/tasks/{task_id}/send")
+async def request_task_send(
+    task_id: int,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """iOS POST'ит финальный (возможно отредактированный) текст для отправки клиенту.
+
+    Mac scheduler через 30 сек подхватит, отправит через Wazzup AmoCRM, отчитается.
+    Если edited_message отличается от оригинального suggested_message — Claude
+    проанализирует разницу и сохранит как style-edit feedback."""
+    check_token(authorization)
+    edited = (payload.get("edited_message") or "").strip()
+    channel = (payload.get("channel") or "").strip() or None
+    if not edited:
+        raise HTTPException(status_code=400, detail="edited_message empty")
+
+    target = None
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            target = t
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
+
+    original = (target.get("suggested_message") or "").strip()
+    target["needs_send"] = True
+    target["pending_send"] = {
+        "edited_message": edited,
+        "original_message": original,
+        "channel": channel,
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+    }
+    save_tasks(tasks_today)
+    log.info(f"task#{task_id}: send requested ({len(edited)} chars, edited={edited != original})")
+    return {"status": "ok", "task_id": task_id, "edited": edited != original}
+
+
+@app.get("/api/internal/tasks/needs_send")
+async def list_tasks_needs_send(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac scheduler poll'ит задачи, которые iOS попросил отправить."""
+    check_internal(authorization)
+    items = [t for t in (tasks_today.get("tasks") or []) if t.get("needs_send")]
+    return {"count": len(items), "tasks": items}
+
+
+@app.post("/api/internal/tasks/{task_id}/sent")
+async def task_sent(
+    task_id: int,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac scheduler отчитывается о результате отправки.
+
+    Body: {success: bool, error?: str, edit_analysis?: str}.
+    edit_analysis — короткий разбор Claude'а, что Vladimir изменил и почему,
+    если редактировал."""
+    check_internal(authorization)
+    success = bool(payload.get("success"))
+    error = (payload.get("error") or "").strip()
+    edit_analysis = (payload.get("edit_analysis") or "").strip()
+
+    target = None
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            target = t
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
+
+    pend = target.get("pending_send") or {}
+    pend["status"] = "sent" if success else "failed"
+    pend["completed_at"] = datetime.now(timezone.utc).isoformat()
+    if error:
+        pend["error"] = error
+    if edit_analysis:
+        pend["edit_analysis"] = edit_analysis
+    target["pending_send"] = pend
+    target["needs_send"] = False
+    save_tasks(tasks_today)
+    log.info(f"task#{task_id}: send {pend['status']} (analysis={'+' if edit_analysis else '-'})")
+    return {"status": "ok", "task_id": task_id}
+
+
 @app.post("/api/internal/tasks/{task_id}/regenerated")
 async def task_regenerated(
     task_id: int,
