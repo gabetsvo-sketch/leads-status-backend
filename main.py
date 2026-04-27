@@ -444,6 +444,9 @@ async def internal_tasks(
         "regen_feedback",
         "regen_requested_at",
         "regen_completed_at",
+        "needs_close",
+        "close_requested_at",
+        "close_error",
     )
     prior_by_id = {
         t.get("task_id"): {k: t.get(k) for k in PRESERVE_KEYS if k in t}
@@ -636,6 +639,72 @@ async def task_sent(
     target["needs_send"] = False
     save_tasks(tasks_today)
     log.info(f"task#{task_id}: send {pend.get('status')} (analysis={'+' if edit_analysis else '-'}, prior={prior_status})")
+    return {"status": "ok", "task_id": task_id}
+
+
+@app.post("/api/tasks/{task_id}/close_no_followup")
+async def request_task_close_no_followup(
+    task_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Vladimir нажал «Завершить без новой задачи» — Mac scheduler закроет
+    задачу в AmoCRM (is_completed=true) без постановки follow-up'а.
+    Сразу убираем из tasks_today, чтобы iOS не показывал её больше."""
+    check_token(authorization)
+    target = None
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            target = t
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
+
+    target["needs_close"] = True
+    target["close_requested_at"] = datetime.now(timezone.utc).isoformat()
+    target["action_state"] = "closing"
+    save_tasks(tasks_today)
+    log.info(f"task#{task_id}: close_no_followup requested")
+    return {"status": "ok", "task_id": task_id}
+
+
+@app.get("/api/internal/tasks/needs_close")
+async def list_tasks_needs_close(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac scheduler poll'ит задачи, которые iOS попросил закрыть без followup'а."""
+    check_internal(authorization)
+    items = [t for t in (tasks_today.get("tasks") or []) if t.get("needs_close")]
+    return {"count": len(items), "tasks": items}
+
+
+@app.post("/api/internal/tasks/{task_id}/closed")
+async def task_closed(
+    task_id: int,
+    payload: dict = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac scheduler отчитывается, что задача закрыта в AmoCRM. Удаляем её
+    из tasks_today — она больше не появится в iOS-списке."""
+    check_internal(authorization)
+    global tasks_today
+    success = bool(payload.get("success", True))
+    error = (payload.get("error") or "").strip()
+
+    if success:
+        before = len(tasks_today.get("tasks") or [])
+        tasks_today["tasks"] = [t for t in (tasks_today.get("tasks") or []) if t.get("task_id") != task_id]
+        save_tasks(tasks_today)
+        log.info(f"task#{task_id}: closed and removed from tasks_today (was {before} → {len(tasks_today['tasks'])})")
+    else:
+        # Откат: убираем флаг needs_close, чтобы iOS показал задачу снова
+        for t in tasks_today.get("tasks") or []:
+            if t.get("task_id") == task_id:
+                t["needs_close"] = False
+                t["action_state"] = None
+                t["close_error"] = error
+                break
+        save_tasks(tasks_today)
+        log.warning(f"task#{task_id}: close failed: {error}")
     return {"status": "ok", "task_id": task_id}
 
 
