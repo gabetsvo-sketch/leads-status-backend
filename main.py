@@ -488,7 +488,60 @@ async def task_feedback(
     fb_file.parent.mkdir(parents=True, exist_ok=True)
     with open(fb_file, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    log.info(f"feedback saved for task#{task_id}: {len(feedback)} chars")
+
+    # Помечаем задачу как needs_regen — Mac scheduler подхватит и перегенерирует
+    # suggested_message с этим feedback'ом в промпте.
+    if task_meta is not None:
+        task_meta["needs_regen"] = True
+        task_meta["regen_feedback"] = feedback
+        task_meta["regen_requested_at"] = entry["received_at"]
+        save_tasks(tasks_today)
+
+    log.info(f"feedback saved for task#{task_id}: {len(feedback)} chars; regen requested")
+    return {"status": "ok", "task_id": task_id, "regen_requested": task_meta is not None}
+
+
+@app.get("/api/internal/tasks/needs_regen")
+async def list_tasks_needs_regen(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac scheduler poll'ит этот endpoint, чтобы найти задачи, требующие
+    перегенерации suggested_message после Vladimir's feedback."""
+    check_internal(authorization)
+    items = [t for t in (tasks_today.get("tasks") or []) if t.get("needs_regen")]
+    return {"count": len(items), "tasks": items}
+
+
+@app.post("/api/internal/tasks/{task_id}/regenerated")
+async def task_regenerated(
+    task_id: int,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac scheduler POST'ит сюда после регенерации с новыми suggested_message
+    и rationale. Сбрасывает needs_regen, обновляет таймстемп."""
+    check_internal(authorization)
+    sug = (payload.get("suggested_message") or "").strip()
+    rat = (payload.get("rationale") or "").strip()
+    ctx = (payload.get("context_summary") or "").strip()
+    found = False
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            if sug:
+                t["suggested_message"] = sug
+            if rat:
+                t["rationale"] = rat
+            if ctx:
+                t["context_summary"] = ctx
+            t["needs_regen"] = False
+            t.pop("regen_feedback", None)
+            t["regen_completed_at"] = datetime.now(timezone.utc).isoformat()
+            found = True
+            break
+    if not found:
+        raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
+    save_tasks(tasks_today)
+    log.info(f"task#{task_id}: regenerated, suggested_message len={len(sug)}")
     return {"status": "ok", "task_id": task_id}
 
 
