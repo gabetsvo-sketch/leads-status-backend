@@ -64,10 +64,12 @@ def detect_color(text: Optional[str]) -> Optional[str]:
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            d = json.loads(STATE_FILE.read_text())
+            d.setdefault("revert_at", None)
+            return d
         except Exception:
             log.exception("failed to load state, starting fresh")
-    return {"color": None, "updated_at": None, "message_id": None}
+    return {"color": None, "updated_at": None, "message_id": None, "revert_at": None}
 
 
 def save_state(state: dict) -> None:
@@ -233,6 +235,12 @@ async def timer_loop():
 
             if changed:
                 save_leads(leads_inbox)
+
+            # Проверяем auto-revert красного статуса по revert_at.
+            try:
+                _maybe_auto_revert()
+            except Exception as e:
+                log.warning(f"timer_loop: auto_revert error: {e}")
         except Exception as e:
             log.error(f"timer_loop iteration error: {e}")
         await asyncio.sleep(TIMER_LOOP_INTERVAL_SEC)
@@ -293,18 +301,50 @@ async def health():
     return {"ok": True}
 
 
+def _maybe_auto_revert() -> bool:
+    """Если color=red и revert_at прошёл — авто-отправляем зелёный.
+    Возвращает True если флипнули."""
+    if state.get("color") != "red":
+        return False
+    revert_at = state.get("revert_at")
+    if not revert_at:
+        return False
+    try:
+        rt = datetime.fromisoformat(revert_at.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    if datetime.now(timezone.utc) < rt:
+        return False
+    # Истёк — отправляем зелёный в чат, обновляем state
+    try:
+        # send_message — async, но эта функция sync. Делаем fire-and-forget.
+        asyncio.create_task(client.send_message(CHAT_ID, SEND_GREEN))
+    except Exception as e:
+        log.warning(f"auto-revert send_message failed: {e}")
+    state["color"] = "green"
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    state["revert_at"] = None
+    state["message_id"] = None
+    save_state(state)
+    log.info("auto-reverted red → green (revert_at expired)")
+    return True
+
+
 @app.get("/status")
 async def status(authorization: Optional[str] = Header(default=None)):
     check_token(authorization)
+    _maybe_auto_revert()
     return {
         "color": state.get("color"),
         "updated_at": state.get("updated_at"),
+        "revert_at": state.get("revert_at"),
     }
 
 
 @app.post("/send")
 async def send(
     color: str = Query(..., pattern="^(red|green)$"),
+    revert_at: Optional[str] = Query(default=None),
     authorization: Optional[str] = Header(default=None),
 ):
     check_token(authorization)
@@ -313,9 +353,21 @@ async def send(
     state["color"] = color
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     state["message_id"] = msg.id
+    # revert_at сохраняем только для red. Для green — обнуляем
+    # (вручную поставленный зелёный — финальный, не должен авто-сбрасываться).
+    if color == "red" and revert_at:
+        # Валидируем ISO8601
+        try:
+            datetime.fromisoformat(revert_at.replace("Z", "+00:00"))
+            state["revert_at"] = revert_at
+        except Exception:
+            log.warning(f"invalid revert_at format: {revert_at!r}, ignoring")
+            state["revert_at"] = None
+    else:
+        state["revert_at"] = None
     save_state(state)
-    log.info("sent %s as message %s; state updated", color, msg.id)
-    return {"sent": color, "emoji": emoji}
+    log.info("sent %s as message %s; state updated (revert_at=%s)", color, msg.id, state.get("revert_at"))
+    return {"sent": color, "emoji": emoji, "revert_at": state.get("revert_at")}
 
 
 # ---------------------------------------------------------------------------
