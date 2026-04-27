@@ -619,19 +619,23 @@ async def task_sent(
         raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
 
     pend = target.get("pending_send") or {}
-    pend["status"] = "sent" if success else "failed"
-    pend["completed_at"] = datetime.now(timezone.utc).isoformat()
+    prior_status = pend.get("status")
+    # Не затираем sent_manually — Vladimir уже сам отправил, scheduler только
+    # делал edit_analysis. Сохраняем sent_manually-статус и awaiting_since.
+    if prior_status != "sent_manually":
+        pend["status"] = "sent" if success else "failed"
+        pend["completed_at"] = datetime.now(timezone.utc).isoformat()
+        if success:
+            target["action_state"] = "awaiting_reply"
+            target["awaiting_since"] = pend["completed_at"]
     if error:
         pend["error"] = error
     if edit_analysis:
         pend["edit_analysis"] = edit_analysis
     target["pending_send"] = pend
     target["needs_send"] = False
-    if success:
-        target["action_state"] = "awaiting_reply"
-        target["awaiting_since"] = pend["completed_at"]
     save_tasks(tasks_today)
-    log.info(f"task#{task_id}: send {pend['status']} (analysis={'+' if edit_analysis else '-'})")
+    log.info(f"task#{task_id}: send {pend.get('status')} (analysis={'+' if edit_analysis else '-'}, prior={prior_status})")
     return {"status": "ok", "task_id": task_id}
 
 
@@ -641,8 +645,10 @@ async def task_mark_sent_manually(
     payload: Optional[dict] = Body(default=None),
     authorization: Optional[str] = Header(default=None),
 ):
-    """Vladimir нажал «Я уже отправил вручную» — переводим задачу в awaiting_reply,
-    чтобы она получила зелёную рамку в списке."""
+    """Vladimir нажал «Я уже отправил вручную» — переводим в awaiting_reply +
+    сохраняем edited_message (то, что Vladimir реально отправил клиенту).
+    Если edited != original suggested — Mac scheduler через 30 сек запустит
+    Claude edit_analysis и сохранит в feedback jsonl как стилевой урок."""
     check_token(authorization)
     target = None
     for t in tasks_today.get("tasks") or []:
@@ -653,8 +659,14 @@ async def task_mark_sent_manually(
         raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
 
     note = ""
+    edited = ""
     if isinstance(payload, dict):
         note = (payload.get("note") or "").strip()
+        edited = (payload.get("edited_message") or "").strip()
+
+    original = (target.get("suggested_message") or "").strip()
+    is_edited = bool(edited) and edited != original
+    needs_analysis = is_edited
 
     now_iso = datetime.now(timezone.utc).isoformat()
     target["action_state"] = "awaiting_reply"
@@ -662,13 +674,18 @@ async def task_mark_sent_manually(
     pend = target.get("pending_send") or {}
     pend["status"] = "sent_manually"
     pend["completed_at"] = now_iso
+    if edited:
+        pend["edited_message"] = edited
+        pend["original_message"] = original
     if note:
         pend["manual_note"] = note
     target["pending_send"] = pend
-    target["needs_send"] = False
+    # Если редактировал — флагим для send_worker'а, чтобы тот сделал edit_analysis
+    # (без реальной отправки через Wazzup, т.к. status=sent_manually).
+    target["needs_send"] = needs_analysis
     save_tasks(tasks_today)
-    log.info(f"task#{task_id}: marked sent manually")
-    return {"status": "ok", "task_id": task_id}
+    log.info(f"task#{task_id}: marked sent_manually (edited={is_edited}, len={len(edited)})")
+    return {"status": "ok", "task_id": task_id, "needs_analysis": is_edited}
 
 
 @app.post("/api/internal/tasks/{task_id}/client_replied")
