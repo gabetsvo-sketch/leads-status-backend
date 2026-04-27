@@ -1,0 +1,36 @@
+name: Deploy to Render
+
+# GitHub-Render webhook сломан (см. инцидент 2026-04-27). Этот workflow
+# триггерит deploy через Render API на каждый push в main как замена.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SERVICE_ID: srv-d7n3t4gsfn5c73drkpmg
+        run: |
+          if [ -z "$RENDER_API_KEY" ]; then
+            echo "::error::RENDER_API_KEY secret is not set in repo settings."
+            exit 1
+          fi
+          response=$(curl -sS -X POST \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            "https://api.render.com/v1/services/$SERVICE_ID/deploys" \
+            -d '{}')
+          echo "Render API response:"
+          echo "$response"
+          deploy_id=$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
+          if [ -z "$deploy_id" ]; then
+            echo "::error::Failed to trigger deploy."
+            exit 1
+          fi
+          echo "Deploy triggered: $deploy_id"
