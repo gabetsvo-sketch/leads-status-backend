@@ -423,21 +423,54 @@ async def internal_tasks(
 ):
     """Mac assistant пушит сегодняшний список задач (полностью заменяет).
 
-    Payload: {"tasks": [{"task_id": int, "lead_id": int, "due": iso, ...}, ...]}
-    """
+    Сохраняем по task_id action_state / pending_send / awaiting_since /
+    client_reply_preview / needs_regen — это user-state, scheduler не знает
+    о нём и не должен затирать."""
     check_internal(authorization)
     tasks = payload.get("tasks") or []
     if not isinstance(tasks, list):
         raise HTTPException(status_code=400, detail="'tasks' must be a list")
 
+    # Извлекаем preserve-поля по task_id из текущего state
+    PRESERVE_KEYS = (
+        "action_state",
+        "awaiting_since",
+        "client_replied_at",
+        "client_reply_preview",
+        "pending_send",
+        "needs_send",
+        "needs_regen",
+        "regen_feedback",
+        "regen_requested_at",
+        "regen_completed_at",
+    )
+    prior_by_id = {
+        t.get("task_id"): {k: t.get(k) for k in PRESERVE_KEYS if k in t}
+        for t in (tasks_today.get("tasks") or [])
+        if t.get("task_id") is not None
+    }
+
+    merged = []
+    for t in tasks:
+        tid = t.get("task_id")
+        prior = prior_by_id.get(tid) or {}
+        # Если scheduler сам перегенерил suggested_message (regen worker), то
+        # эти поля придут в новом payload — оставляем новые. Но user-action
+        # поля (action_state, pending_send) — preserve.
+        for k, v in prior.items():
+            if v is not None and k not in t:
+                t[k] = v
+        merged.append(t)
+
     global tasks_today
     tasks_today = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "tasks": tasks,
+        "tasks": merged,
     }
     save_tasks(tasks_today)
-    log.info(f"tasks_today updated: {len(tasks)} items")
-    return {"status": "ok", "count": len(tasks)}
+    preserved = sum(1 for t in merged if t.get("action_state") or t.get("pending_send"))
+    log.info(f"tasks_today updated: {len(merged)} items ({preserved} с action_state/pending_send preserved)")
+    return {"status": "ok", "count": len(merged)}
 
 
 @app.get("/api/tasks/today")
@@ -594,8 +627,74 @@ async def task_sent(
         pend["edit_analysis"] = edit_analysis
     target["pending_send"] = pend
     target["needs_send"] = False
+    if success:
+        target["action_state"] = "awaiting_reply"
+        target["awaiting_since"] = pend["completed_at"]
     save_tasks(tasks_today)
     log.info(f"task#{task_id}: send {pend['status']} (analysis={'+' if edit_analysis else '-'})")
+    return {"status": "ok", "task_id": task_id}
+
+
+@app.post("/api/tasks/{task_id}/mark_sent_manually")
+async def task_mark_sent_manually(
+    task_id: int,
+    payload: Optional[dict] = Body(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Vladimir нажал «Я уже отправил вручную» — переводим задачу в awaiting_reply,
+    чтобы она получила зелёную рамку в списке."""
+    check_token(authorization)
+    target = None
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            target = t
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
+
+    note = ""
+    if isinstance(payload, dict):
+        note = (payload.get("note") or "").strip()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    target["action_state"] = "awaiting_reply"
+    target["awaiting_since"] = now_iso
+    pend = target.get("pending_send") or {}
+    pend["status"] = "sent_manually"
+    pend["completed_at"] = now_iso
+    if note:
+        pend["manual_note"] = note
+    target["pending_send"] = pend
+    target["needs_send"] = False
+    save_tasks(tasks_today)
+    log.info(f"task#{task_id}: marked sent manually")
+    return {"status": "ok", "task_id": task_id}
+
+
+@app.post("/api/internal/tasks/{task_id}/client_replied")
+async def task_client_replied(
+    task_id: int,
+    payload: Optional[dict] = Body(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac scheduler детектил входящее сообщение от клиента → переключаем
+    задачу в client_replied (визуально другой цвет)."""
+    check_internal(authorization)
+    target = None
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            target = t
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
+    target["action_state"] = "client_replied"
+    target["client_replied_at"] = datetime.now(timezone.utc).isoformat()
+    if isinstance(payload, dict):
+        preview = (payload.get("preview") or "")[:300]
+        if preview:
+            target["client_reply_preview"] = preview
+    save_tasks(tasks_today)
+    log.info(f"task#{task_id}: client_replied")
     return {"status": "ok", "task_id": task_id}
 
 
