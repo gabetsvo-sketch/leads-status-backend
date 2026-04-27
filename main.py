@@ -427,6 +427,7 @@ async def internal_tasks(
     client_reply_preview / needs_regen — это user-state, scheduler не знает
     о нём и не должен затирать."""
     check_internal(authorization)
+    global tasks_today
     tasks = payload.get("tasks") or []
     if not isinstance(tasks, list):
         raise HTTPException(status_code=400, detail="'tasks' must be a list")
@@ -462,7 +463,6 @@ async def internal_tasks(
                 t[k] = v
         merged.append(t)
 
-    global tasks_today
     tasks_today = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "tasks": merged,
