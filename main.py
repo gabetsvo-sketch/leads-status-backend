@@ -31,6 +31,7 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 LEADS_FILE = Path(os.environ.get("LEADS_FILE", "leads.json"))
 LEADS_RETENTION = int(os.environ.get("LEADS_RETENTION", "200"))  # сколько лидов хранить в памяти
 TASKS_FILE = Path(os.environ.get("TASKS_FILE", "tasks_today.json"))
+INSTRUCTIONS_FILE = Path(os.environ.get("INSTRUCTIONS_FILE", "instructions.json"))
 NEWS_FILE = Path(os.environ.get("NEWS_FILE", "news.json"))
 
 # Phase 2 timers (Vladimir spec):
@@ -140,10 +141,26 @@ def save_news(items: list) -> None:
     NEWS_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2))
 
 
+def load_instructions() -> list:
+    """Свободно-форматные инструкции от Vladimir'а («закрой Светлану»,
+    «Анну перенеси на завтра»). Список dict со status: pending/applied/failed."""
+    if INSTRUCTIONS_FILE.exists():
+        try:
+            return json.loads(INSTRUCTIONS_FILE.read_text())
+        except Exception:
+            log.exception("failed to load instructions, starting fresh")
+    return []
+
+
+def save_instructions(items: list) -> None:
+    INSTRUCTIONS_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2))
+
+
 state = load_state()
 leads_inbox: list = load_leads()  # most-recent-first
 tasks_today: dict = load_tasks()  # {"updated_at": iso, "tasks": [...]}
 news_inbox: list = load_news()    # [{id, url, title, ..., status}, ...]
+instructions_log: list = load_instructions()  # [{id, text, status, created_at, applied_at, result}, ...]
 client: Optional[TelegramClient] = None
 
 
@@ -1086,6 +1103,91 @@ async def reject_news(
             log.info(f"news {news_id}: rejected")
             return {"status": "ok", "news_id": news_id}
     raise HTTPException(status_code=404, detail="news not found")
+
+
+# ---------------------------------------------------------------------------
+# Free-form task instructions (build 14)
+#
+# Vladimir пишет в свободной форме «закрой Светлану», «Анну перенеси на завтра»,
+# «Олегу поставь follow-up через неделю». Backend сохраняет инструкции в очередь;
+# scheduler парсит через Claude и выполняет в AmoCRM (отдельная итерация).
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/tasks/instructions")
+async def post_task_instruction(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """iOS POST'ит свободно-форматную инструкцию. Сохраняем со status=pending."""
+    check_token(authorization)
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="'text' required")
+    if len(text) > 4000:
+        raise HTTPException(status_code=400, detail="'text' too long (max 4000)")
+
+    iid = f"instr-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    entry = {
+        "id": iid,
+        "text": text,
+        "status": "pending",   # pending | parsing | applied | failed
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "applied_at": None,
+        "result": None,         # сюда scheduler пишет что сделано (или error)
+    }
+    instructions_log.append(entry)
+    # Храним последние 200 инструкций
+    if len(instructions_log) > 200:
+        del instructions_log[: len(instructions_log) - 200]
+    save_instructions(instructions_log)
+    log.info(f"instruction {iid} saved: «{text[:80]}»")
+    return {"status": "ok", "id": iid}
+
+
+@app.get("/api/tasks/instructions")
+async def list_task_instructions(
+    limit: int = 20,
+    authorization: Optional[str] = Header(default=None),
+):
+    """iOS GET'ит последние N инструкций со статусами для отображения."""
+    check_token(authorization)
+    items = instructions_log[-limit:][::-1]  # newest first
+    return {"count": len(items), "instructions": items}
+
+
+@app.get("/api/internal/tasks/instructions")
+async def internal_list_instructions(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac scheduler poll'ит pending-инструкции для парсинга."""
+    check_internal(authorization)
+    pending = [i for i in instructions_log if i.get("status") == "pending"]
+    return {"count": len(pending), "instructions": pending}
+
+
+@app.post("/api/internal/tasks/instructions/{instruction_id}/done")
+async def internal_instruction_done(
+    instruction_id: str,
+    payload: dict = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Scheduler отчитывается о выполнении: status=applied|failed + result."""
+    check_internal(authorization)
+    status_val = payload.get("status") or "applied"
+    if status_val not in ("applied", "failed", "parsing"):
+        raise HTTPException(status_code=400, detail="invalid status")
+    result = payload.get("result") or ""
+    for entry in instructions_log:
+        if entry.get("id") == instruction_id:
+            entry["status"] = status_val
+            if status_val in ("applied", "failed"):
+                entry["applied_at"] = datetime.now(timezone.utc).isoformat()
+            entry["result"] = str(result)[:2000]
+            save_instructions(instructions_log)
+            log.info(f"instruction {instruction_id}: {status_val} — {str(result)[:80]}")
+            return {"status": "ok"}
+    raise HTTPException(status_code=404, detail="instruction not found")
 
 
 if __name__ == "__main__":
