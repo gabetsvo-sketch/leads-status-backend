@@ -12,6 +12,8 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
+import notifier
+
 load_dotenv()
 
 logging.basicConfig(
@@ -301,6 +303,55 @@ async def health():
     return {"ok": True}
 
 
+@app.post("/api/devices/register")
+async def register_device(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """iOS app регистрирует свой APNs device token.
+
+    Body: {"device_token": "<hex>", "live_activity_token": "<hex>"?, "app_version": "..."?}
+    """
+    check_token(authorization)
+    device_token = (payload.get("device_token") or "").strip()
+    if not device_token:
+        raise HTTPException(status_code=400, detail="device_token required")
+    entry = notifier.upsert_device(
+        device_token,
+        live_activity_token=payload.get("live_activity_token"),
+        app_version=payload.get("app_version"),
+    )
+    log.info(f"device registered token={device_token[:8]}… version={entry.get('app_version','')}")
+    return {"status": "ok", "registered_at": entry["registered_at"]}
+
+
+@app.post("/api/devices/unregister")
+async def unregister_device(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    check_token(authorization)
+    device_token = (payload.get("device_token") or "").strip()
+    if not device_token:
+        raise HTTPException(status_code=400, detail="device_token required")
+    removed = notifier.remove_device(device_token)
+    return {"status": "ok", "removed": removed}
+
+
+@app.post("/api/devices/test_push")
+async def trigger_test_push(
+    payload: dict = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Internal helper: send a test push to all registered devices.
+    Useful for end-to-end verification without an actual lead."""
+    check_internal(authorization)
+    title = (payload.get("title") or "Тестовый пуш").strip()
+    body = (payload.get("body") or "Если ты это видишь — APNs работает.").strip()
+    res = await notifier.send_alert_push(title=title, body=body, custom={"kind": "test"})
+    return res
+
+
 def _maybe_auto_revert() -> bool:
     """Если color=red и revert_at прошёл — авто-отправляем зелёный.
     Возвращает True если флипнули."""
@@ -426,6 +477,13 @@ async def internal_lead(
         await client.send_message("me", msg)
     except Exception as e:
         log.warning(f"Telegram notify failed: {e}")
+
+    # APNs push to all registered iOS devices
+    try:
+        push_result = await notifier.send_lead_push(entry)
+        log.info(f"lead push: {push_result}")
+    except Exception as e:
+        log.warning(f"APNs notify failed: {e}")
 
     return {"status": "ok", "lead_id": lead_id, "inbox_size": len(leads_inbox)}
 
