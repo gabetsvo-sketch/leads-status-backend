@@ -133,11 +133,15 @@ async def _get_apns_client():
         try:
             from aioapns import APNs
 
+            # aioapns expects a filesystem path for `key`, not PEM contents,
+            # so materialize the env-var-encoded key to a temp file once.
             key_pem = base64.b64decode(APNS_KEY_P8_B64).decode("utf-8")
+            key_path = Path("/tmp") / f"apns_{APNS_KEY_ID}.p8"
+            key_path.write_text(key_pem, encoding="utf-8")
             use_sandbox = APNS_ENVIRONMENT == "sandbox"
 
             _apns_client = APNs(
-                key=key_pem,
+                key=str(key_path),
                 key_id=APNS_KEY_ID,
                 team_id=APNS_TEAM_ID,
                 topic=APNS_BUNDLE_ID,
