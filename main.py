@@ -1119,7 +1119,11 @@ async def post_task_instruction(
     payload: dict = Body(...),
     authorization: Optional[str] = Header(default=None),
 ):
-    """iOS POST'ит свободно-форматную инструкцию. Сохраняем со status=pending."""
+    """iOS POST'ит свободно-форматную инструкцию. Сохраняем со status=pending.
+
+    task_id — опционально: если инструкция отправлена ИЗ КАРТОЧКИ задачи,
+    scheduler знает контекст без парсинга имени клиента. Без task_id —
+    глобальная инструкция (например, "закрой все Лагуны")."""
     check_token(authorization)
     text = (payload.get("text") or "").strip()
     if not text:
@@ -1127,11 +1131,18 @@ async def post_task_instruction(
     if len(text) > 4000:
         raise HTTPException(status_code=400, detail="'text' too long (max 4000)")
 
+    task_id = payload.get("task_id")
+    try:
+        task_id = int(task_id) if task_id is not None else None
+    except (TypeError, ValueError):
+        task_id = None
+
     iid = f"instr-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
     entry = {
         "id": iid,
         "text": text,
-        "status": "pending",   # pending | parsing | applied | failed
+        "task_id": task_id,    # int or None
+        "status": "pending",    # pending | parsing | applied | failed
         "created_at": datetime.now(timezone.utc).isoformat(),
         "applied_at": None,
         "result": None,         # сюда scheduler пишет что сделано (или error)
@@ -1141,18 +1152,23 @@ async def post_task_instruction(
     if len(instructions_log) > 200:
         del instructions_log[: len(instructions_log) - 200]
     save_instructions(instructions_log)
-    log.info(f"instruction {iid} saved: «{text[:80]}»")
+    log.info(f"instruction {iid} saved (task_id={task_id}): «{text[:80]}»")
     return {"status": "ok", "id": iid}
 
 
 @app.get("/api/tasks/instructions")
 async def list_task_instructions(
     limit: int = 20,
+    task_id: Optional[int] = None,
     authorization: Optional[str] = Header(default=None),
 ):
-    """iOS GET'ит последние N инструкций со статусами для отображения."""
+    """iOS GET'ит последние N инструкций со статусами.
+    Если передан task_id — только инструкции по этой задаче (для карточки)."""
     check_token(authorization)
-    items = instructions_log[-limit:][::-1]  # newest first
+    items = list(instructions_log)
+    if task_id is not None:
+        items = [i for i in items if i.get("task_id") == task_id]
+    items = items[-limit:][::-1]  # newest first
     return {"count": len(items), "instructions": items}
 
 
