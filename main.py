@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -92,10 +92,35 @@ def save_leads(items: list) -> None:
 def load_tasks() -> dict:
     if TASKS_FILE.exists():
         try:
-            return json.loads(TASKS_FILE.read_text())
+            data = json.loads(TASKS_FILE.read_text())
+            # Backward-compat: добавляем completed_today если поля нет
+            if "completed_today" not in data:
+                data["completed_today"] = []
+            return data
         except Exception:
             log.exception("failed to load tasks, starting fresh")
-    return {"updated_at": None, "tasks": []}
+    return {"updated_at": None, "tasks": [], "completed_today": []}
+
+
+def _prune_completed_today(payload: dict) -> None:
+    """Удаляет из completed_today записи старше 24 часов.
+    Безопасно вызывать при каждом save — не делает много работы."""
+    completed = payload.get("completed_today") or []
+    if not completed:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    fresh = []
+    for t in completed:
+        ts = t.get("closed_at")
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt >= cutoff:
+                fresh.append(t)
+        except Exception:
+            pass
+    payload["completed_today"] = fresh
 
 
 def save_tasks(payload: dict) -> None:
@@ -530,12 +555,20 @@ async def internal_tasks(
 
 @app.get("/api/tasks/today")
 async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
-    """iOS GET'ит сегодняшний список задач."""
+    """iOS GET'ит сегодняшний список задач + выполненные за последние 24 часа.
+
+    completed_today показывается в iOS в свёрнутом блоке внизу — Vladimir
+    может развернуть и посмотреть что уже сделано сегодня.
+    """
     check_token(authorization)
+    # Чистим устаревшие completed на read (не на write — чтобы iOS-pull
+    # делал одно и то же даже если scheduler пока не работал).
+    _prune_completed_today(tasks_today)
     return {
         "count": len(tasks_today.get("tasks") or []),
         "updated_at": tasks_today.get("updated_at"),
         "tasks": tasks_today.get("tasks") or [],
+        "completed_today": tasks_today.get("completed_today") or [],
     }
 
 
@@ -744,9 +777,23 @@ async def task_closed(
 
     if success:
         before = len(tasks_today.get("tasks") or [])
-        tasks_today["tasks"] = [t for t in (tasks_today.get("tasks") or []) if t.get("task_id") != task_id]
+        # Перемещаем закрытую задачу в completed_today вместо удаления.
+        # iOS показывает её в свёрнутом блоке «Выполненные сегодня».
+        closed_task = None
+        remaining = []
+        for t in (tasks_today.get("tasks") or []):
+            if t.get("task_id") == task_id:
+                closed_task = t
+            else:
+                remaining.append(t)
+        tasks_today["tasks"] = remaining
+        if closed_task is not None:
+            closed_task["closed_at"] = datetime.now(timezone.utc).isoformat()
+            closed_task["close_method"] = "no_followup"
+            tasks_today.setdefault("completed_today", []).append(closed_task)
+        _prune_completed_today(tasks_today)
         save_tasks(tasks_today)
-        log.info(f"task#{task_id}: closed and removed from tasks_today (was {before} → {len(tasks_today['tasks'])})")
+        log.info(f"task#{task_id}: closed → completed_today (tasks {before} → {len(remaining)}, completed: {len(tasks_today.get('completed_today') or [])})")
     else:
         # Откат: убираем флаг needs_close, чтобы iOS показал задачу снова
         for t in tasks_today.get("tasks") or []:
