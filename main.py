@@ -34,6 +34,16 @@ TASKS_FILE = Path(os.environ.get("TASKS_FILE", "tasks_today.json"))
 INSTRUCTIONS_FILE = Path(os.environ.get("INSTRUCTIONS_FILE", "instructions.json"))
 ANTHROPIC_HEALTH_FILE = Path(os.environ.get("ANTHROPIC_HEALTH_FILE", "anthropic_health.json"))
 NEWS_FILE = Path(os.environ.get("NEWS_FILE", "news.json"))
+DEVICES_FILE = Path(os.environ.get("DEVICES_FILE", "devices.json"))
+
+# APNs config (build 20). Файл .p8 либо лежит на диске (APNS_AUTH_KEY_FILE),
+# либо передаётся целиком через env (APNS_AUTH_KEY_CONTENT) — для Render.
+APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "").strip()
+APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "").strip()
+APNS_BUNDLE_ID = os.environ.get("APNS_BUNDLE_ID", "com.gabetsvo.LeadsStatus").strip()
+APNS_USE_SANDBOX = os.environ.get("APNS_USE_SANDBOX", "false").lower() in ("1", "true", "yes")
+APNS_AUTH_KEY_FILE = os.environ.get("APNS_AUTH_KEY_FILE", "").strip()
+APNS_AUTH_KEY_CONTENT = os.environ.get("APNS_AUTH_KEY_CONTENT", "").strip()
 
 # Phase 2 timers (Vladimir spec):
 # - 3 мин после получения лида, если не open → системное сообщение (semi-auto)
@@ -179,13 +189,124 @@ def save_anthropic_health(payload: dict) -> None:
     ANTHROPIC_HEALTH_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def load_devices() -> list:
+    """Список зарегистрированных device tokens iOS для APNs push.
+    Структура: [{device_token, registered_at, last_seen_at, app_version}]"""
+    if DEVICES_FILE.exists():
+        try:
+            return json.loads(DEVICES_FILE.read_text())
+        except Exception:
+            log.exception("failed to load devices, starting empty")
+    return []
+
+
+def save_devices(items: list) -> None:
+    DEVICES_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2))
+
+
 state = load_state()
 leads_inbox: list = load_leads()  # most-recent-first
 tasks_today: dict = load_tasks()  # {"updated_at": iso, "tasks": [...]}
 news_inbox: list = load_news()    # [{id, url, title, ..., status}, ...]
 instructions_log: list = load_instructions()  # [{id, text, status, created_at, applied_at, result}, ...]
 anthropic_health: dict = load_anthropic_health()
+devices_registry: list = load_devices()
 client: Optional[TelegramClient] = None
+_apns_client = None  # lazy-init
+
+
+def _resolve_apns_key_path() -> Optional[str]:
+    """Возвращает путь к .p8 ключу. Если задан APNS_AUTH_KEY_CONTENT (целиком
+    содержимое в env, для Render) — записывает в /tmp/AuthKey.p8 и возвращает
+    путь. Если задан APNS_AUTH_KEY_FILE — возвращает его. Иначе None."""
+    if APNS_AUTH_KEY_CONTENT:
+        path = "/tmp/AuthKey_apns.p8"
+        try:
+            with open(path, "w") as f:
+                f.write(APNS_AUTH_KEY_CONTENT.replace("\\n", "\n"))
+            os.chmod(path, 0o600)
+            return path
+        except Exception as e:
+            log.warning(f"APNS: не удалось записать ключ из APNS_AUTH_KEY_CONTENT: {e}")
+            return None
+    if APNS_AUTH_KEY_FILE and Path(APNS_AUTH_KEY_FILE).exists():
+        return APNS_AUTH_KEY_FILE
+    return None
+
+
+def _get_apns_client():
+    """Lazy-initialized APNs client. Возвращает None если конфиг неполный."""
+    global _apns_client
+    if _apns_client is not None:
+        return _apns_client
+    if not (APNS_KEY_ID and APNS_TEAM_ID and APNS_BUNDLE_ID):
+        return None
+    key_path = _resolve_apns_key_path()
+    if not key_path:
+        return None
+    try:
+        from aioapns import APNs
+        _apns_client = APNs(
+            key=key_path,
+            key_id=APNS_KEY_ID,
+            team_id=APNS_TEAM_ID,
+            topic=APNS_BUNDLE_ID,
+            use_sandbox=APNS_USE_SANDBOX,
+        )
+        log.info(f"APNS: client initialized (sandbox={APNS_USE_SANDBOX}, topic={APNS_BUNDLE_ID})")
+        return _apns_client
+    except Exception as e:
+        log.warning(f"APNS: client init failed: {e}")
+        return None
+
+
+async def send_push_to_all(title: str, body: str, payload: Optional[dict] = None) -> int:
+    """Шлёт push на все зарегистрированные устройства. Возвращает кол-во успешных."""
+    apns = _get_apns_client()
+    if not apns:
+        log.info("APNS: client not available, skipping push")
+        return 0
+    if not devices_registry:
+        return 0
+    from aioapns import NotificationRequest, PushType
+    sent = 0
+    failed: list = []
+    for dev in list(devices_registry):
+        token = dev.get("device_token") or ""
+        if not token:
+            continue
+        try:
+            msg = {
+                "aps": {
+                    "alert": {"title": title, "body": body},
+                    "sound": "default",
+                    "badge": 1,
+                }
+            }
+            if payload:
+                msg.update(payload)
+            req = NotificationRequest(
+                device_token=token,
+                message=msg,
+                push_type=PushType.ALERT,
+            )
+            resp = await apns.send_notification(req)
+            if getattr(resp, "is_successful", False) or getattr(resp, "status", "") == "200":
+                sent += 1
+            else:
+                reason = getattr(resp, "description", "") or str(resp)
+                log.warning(f"APNS: failed for {token[:10]}…: {reason}")
+                # Если токен невалиден — помечаем для удаления
+                if "BadDeviceToken" in reason or "Unregistered" in reason:
+                    failed.append(token)
+        except Exception as e:
+            log.warning(f"APNS: send error for {token[:10]}…: {e}")
+    # Чистим невалидные токены
+    if failed:
+        devices_registry[:] = [d for d in devices_registry if d.get("device_token") not in failed]
+        save_devices(devices_registry)
+        log.info(f"APNS: removed {len(failed)} invalid device tokens")
+    return sent
 
 
 async def backfill_from_history(limit: int = 200) -> None:
@@ -493,7 +614,59 @@ async def internal_lead(
     except Exception as e:
         log.warning(f"Telegram notify failed: {e}")
 
+    # APNs push на iOS — мгновенное уведомление о новой заявке (build 20)
+    try:
+        push_title = "Новая заявка"
+        body_parts = []
+        if entry["name"]:
+            body_parts.append(entry["name"])
+        if entry["source"]:
+            body_parts.append(entry["source"])
+        push_body = " · ".join(body_parts) or f"Лид #{lead_id}"
+        sent_count = await send_push_to_all(
+            title=push_title,
+            body=push_body,
+            payload={"kind": "new_lead", "lead_id": lead_id},
+        )
+        if sent_count > 0:
+            log.info(f"APNS: уведомление о лиде #{lead_id} → {sent_count} устройств")
+    except Exception as e:
+        log.warning(f"APNS push failed: {e}")
+
     return {"status": "ok", "lead_id": lead_id, "inbox_size": len(leads_inbox)}
+
+
+@app.post("/api/devices/register")
+async def register_device(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """iOS POST'ит APNs device_token при первом запуске (PushManager).
+    Сохраняем для последующих push-уведомлений о новых лидах (build 20).
+    Дедуп по token — повторная регистрация не плодит записи."""
+    check_token(authorization)
+    token = (payload.get("device_token") or "").strip()
+    if not token or len(token) < 32:
+        raise HTTPException(status_code=400, detail="device_token required (hex string)")
+    app_version = (payload.get("app_version") or "").strip()
+    now = datetime.now(timezone.utc).isoformat()
+    # Update or insert
+    for d in devices_registry:
+        if d.get("device_token") == token:
+            d["last_seen_at"] = now
+            if app_version:
+                d["app_version"] = app_version
+            save_devices(devices_registry)
+            return {"status": "ok", "action": "refreshed", "total_devices": len(devices_registry)}
+    devices_registry.append({
+        "device_token": token,
+        "registered_at": now,
+        "last_seen_at": now,
+        "app_version": app_version,
+    })
+    save_devices(devices_registry)
+    log.info(f"device registered: {token[:10]}… app_version={app_version}, total={len(devices_registry)}")
+    return {"status": "ok", "action": "registered", "total_devices": len(devices_registry)}
 
 
 @app.get("/api/leads")
