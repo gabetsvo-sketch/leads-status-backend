@@ -32,6 +32,7 @@ LEADS_FILE = Path(os.environ.get("LEADS_FILE", "leads.json"))
 LEADS_RETENTION = int(os.environ.get("LEADS_RETENTION", "200"))  # сколько лидов хранить в памяти
 TASKS_FILE = Path(os.environ.get("TASKS_FILE", "tasks_today.json"))
 INSTRUCTIONS_FILE = Path(os.environ.get("INSTRUCTIONS_FILE", "instructions.json"))
+ANTHROPIC_HEALTH_FILE = Path(os.environ.get("ANTHROPIC_HEALTH_FILE", "anthropic_health.json"))
 NEWS_FILE = Path(os.environ.get("NEWS_FILE", "news.json"))
 
 # Phase 2 timers (Vladimir spec):
@@ -156,11 +157,34 @@ def save_instructions(items: list) -> None:
     INSTRUCTIONS_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2))
 
 
+def load_anthropic_health() -> dict:
+    """Здоровье Anthropic API: трекаем последнюю balance-ошибку.
+    Простая структура: { last_balance_error_at, last_ok_at, calls_today,
+    errors_today, day_key (BKK YYYY-MM-DD для сброса счётчиков) }."""
+    if ANTHROPIC_HEALTH_FILE.exists():
+        try:
+            return json.loads(ANTHROPIC_HEALTH_FILE.read_text())
+        except Exception:
+            log.exception("failed to load anthropic_health, starting fresh")
+    return {
+        "last_balance_error_at": None,
+        "last_ok_at": None,
+        "calls_today": 0,
+        "errors_today": 0,
+        "day_key": None,
+    }
+
+
+def save_anthropic_health(payload: dict) -> None:
+    ANTHROPIC_HEALTH_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 state = load_state()
 leads_inbox: list = load_leads()  # most-recent-first
 tasks_today: dict = load_tasks()  # {"updated_at": iso, "tasks": [...]}
 news_inbox: list = load_news()    # [{id, url, title, ..., status}, ...]
 instructions_log: list = load_instructions()  # [{id, text, status, created_at, applied_at, result}, ...]
+anthropic_health: dict = load_anthropic_health()
 client: Optional[TelegramClient] = None
 
 
@@ -1204,6 +1228,85 @@ async def internal_instruction_done(
             log.info(f"instruction {instruction_id}: {status_val} — {str(result)[:80]}")
             return {"status": "ok"}
     raise HTTPException(status_code=404, detail="instruction not found")
+
+
+# ---------------------------------------------------------------------------
+# Anthropic API health (build 17)
+#
+# Scheduler репортит каждый Claude-вызов: ok / balance_low / other_error.
+# iOS показывает виджет на главной — сразу видно когда баланс на нуле.
+# ---------------------------------------------------------------------------
+
+
+def _bkk_day_key() -> str:
+    """YYYY-MM-DD по Bangkok timezone — для сброса дневных счётчиков."""
+    bkk = timezone(timedelta(hours=7))
+    return datetime.now(bkk).strftime("%Y-%m-%d")
+
+
+def _reset_health_if_new_day() -> None:
+    today = _bkk_day_key()
+    if anthropic_health.get("day_key") != today:
+        anthropic_health["day_key"] = today
+        anthropic_health["calls_today"] = 0
+        anthropic_health["errors_today"] = 0
+
+
+@app.post("/api/internal/anthropic/event")
+async def internal_anthropic_event(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Scheduler репортит каждый Claude-вызов.
+    payload: {type: 'ok'|'balance_low'|'error', error?: str}
+    """
+    check_internal(authorization)
+    _reset_health_if_new_day()
+    event_type = payload.get("type") or "ok"
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    anthropic_health["calls_today"] = (anthropic_health.get("calls_today") or 0) + 1
+    if event_type == "ok":
+        anthropic_health["last_ok_at"] = now_iso
+    elif event_type == "balance_low":
+        anthropic_health["last_balance_error_at"] = now_iso
+        anthropic_health["errors_today"] = (anthropic_health.get("errors_today") or 0) + 1
+    elif event_type == "error":
+        anthropic_health["errors_today"] = (anthropic_health.get("errors_today") or 0) + 1
+    save_anthropic_health(anthropic_health)
+    return {"status": "ok"}
+
+
+@app.get("/api/anthropic/health")
+async def get_anthropic_health(authorization: Optional[str] = Header(default=None)):
+    """iOS подтягивает: status (ok/balance_low/unknown) + дневная статистика."""
+    check_token(authorization)
+    _reset_health_if_new_day()
+
+    # Считаем status: balance_low если последняя balance-ошибка свежее
+    # последнего успешного вызова (или ok-вызовов вообще не было).
+    status_val = "unknown"
+    last_err = anthropic_health.get("last_balance_error_at")
+    last_ok = anthropic_health.get("last_ok_at")
+    if last_err and last_ok:
+        try:
+            err_dt = datetime.fromisoformat(last_err.replace("Z", "+00:00"))
+            ok_dt = datetime.fromisoformat(last_ok.replace("Z", "+00:00"))
+            status_val = "balance_low" if err_dt > ok_dt else "ok"
+        except Exception:
+            status_val = "unknown"
+    elif last_err and not last_ok:
+        status_val = "balance_low"
+    elif last_ok and not last_err:
+        status_val = "ok"
+
+    return {
+        "status": status_val,
+        "calls_today": anthropic_health.get("calls_today") or 0,
+        "errors_today": anthropic_health.get("errors_today") or 0,
+        "last_balance_error_at": last_err,
+        "last_ok_at": last_ok,
+    }
 
 
 if __name__ == "__main__":
