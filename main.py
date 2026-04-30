@@ -385,6 +385,11 @@ async def timer_loop():
                     continue
                 if L.get("acked"):
                     continue
+                # Build 22: seen=true → Vladimir уже открыл лид и видит draft.
+                # Timer fallback не нужен, но лид остаётся в new-inbox (не ack)
+                # пока он не свайпнет «взял в работу».
+                if L.get("seen"):
+                    continue
                 rec = L.get("received_at", "")
                 if not rec:
                     continue
@@ -715,6 +720,27 @@ async def unack_lead(
         if L.get("lead_id") == lead_id:
             L["acked"] = False
             L.pop("acked_at", None)
+            save_leads(leads_inbox)
+            return {"status": "ok", "lead_id": lead_id}
+    raise HTTPException(status_code=404, detail="lead not found")
+
+
+@app.post("/api/leads/{lead_id}/seen")
+async def seen_lead(
+    lead_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Vladimir открыл detail-экран лида. Останавливает 3-min timer (он уже
+    видит draft и сам напишет), но лид остаётся в new-inbox — не пропадает
+    с главного экрана пока Vladimir не свайпнет «взял в работу» (ack).
+
+    Build 22: разделяет смешанную семантику старого ack — раньше открытие
+    detail'a одновременно и timer останавливало, и лид прятало из inbox."""
+    check_token(authorization)
+    for L in leads_inbox:
+        if L.get("lead_id") == lead_id:
+            L["seen"] = True
+            L["seen_at"] = datetime.now(timezone.utc).isoformat()
             save_leads(leads_inbox)
             return {"status": "ok", "lead_id": lead_id}
     raise HTTPException(status_code=404, detail="lead not found")
