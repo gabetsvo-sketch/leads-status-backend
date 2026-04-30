@@ -702,6 +702,24 @@ async def ack_lead(
     raise HTTPException(status_code=404, detail="lead not found")
 
 
+@app.post("/api/leads/{lead_id}/unack")
+async def unack_lead(
+    lead_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Вернуть лид в «новые заявки» — снять acked. Используется assistant
+    scheduler'ом когда `prune_stale_leads` ошибочно ack'нул лид (например
+    статус был «Первичный контакт», а Vladimir ещё не свайпнул)."""
+    check_token(authorization)
+    for L in leads_inbox:
+        if L.get("lead_id") == lead_id:
+            L["acked"] = False
+            L.pop("acked_at", None)
+            save_leads(leads_inbox)
+            return {"status": "ok", "lead_id": lead_id}
+    raise HTTPException(status_code=404, detail="lead not found")
+
+
 # ---------------------------------------------------------------------------
 # Today's tasks (push from Mac assistant scheduler, GET from iOS)
 # ---------------------------------------------------------------------------
