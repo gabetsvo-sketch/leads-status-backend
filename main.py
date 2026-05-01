@@ -930,6 +930,108 @@ async def request_task_send(
     return {"status": "ok", "task_id": task_id, "edited": edited != original}
 
 
+@app.post("/api/tasks/{task_id}/schedule_send")
+async def schedule_task_send(
+    task_id: int,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 24: отложенная отправка. iOS POST'ит {message, channel, scheduled_at}.
+    scheduler `_scheduled_send_worker_loop` (30s polling) каждые 30 сек проверяет
+    pending_send.scheduled_at; в назначенное время вызывает прямую отправку
+    через WhatsApp Web / Telegram Web в Mac Chromium (стабильный путь),
+    минуя нестабильный AmoCRM browser. Wazzup-связка AmoCRM сама подхватит
+    исходящее в карточку клиента через несколько секунд.
+    """
+    check_token(authorization)
+    edited = (payload.get("message") or payload.get("edited_message") or "").strip()
+    channel = (payload.get("channel") or "").strip().lower()
+    scheduled_at = (payload.get("scheduled_at") or "").strip()
+
+    if not edited:
+        raise HTTPException(status_code=400, detail="message empty")
+    if channel not in ("whatsapp", "telegram"):
+        raise HTTPException(status_code=400, detail="channel must be whatsapp|telegram")
+    if not scheduled_at:
+        raise HTTPException(status_code=400, detail="scheduled_at (ISO datetime) required")
+    try:
+        # Принимаем ISO 8601 с любой TZ (Z или +07:00 или naive)
+        dt = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"scheduled_at parse error: {e}")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    scheduled_iso = dt.isoformat()
+
+    target = None
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            target = t
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
+
+    original = (target.get("suggested_message") or "").strip()
+    target["pending_send"] = {
+        "edited_message": edited,
+        "original_message": original,
+        "channel": channel,
+        "scheduled_at": scheduled_iso,
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "status": "scheduled",
+    }
+    # needs_send=False — пока не время. Scheduler scheduled-worker подхватит сам.
+    target["needs_send"] = False
+    save_tasks(tasks_today)
+    log.info(f"task#{task_id}: scheduled send at {scheduled_iso} via {channel} ({len(edited)} chars)")
+    return {"status": "ok", "task_id": task_id, "scheduled_at": scheduled_iso, "channel": channel}
+
+
+@app.post("/api/tasks/{task_id}/cancel_scheduled")
+async def cancel_scheduled_send(
+    task_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 24: отменить отложенную отправку — Vladimir передумал."""
+    check_token(authorization)
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            pend = t.get("pending_send") or {}
+            if pend.get("status") == "scheduled":
+                t["pending_send"] = None
+                t["needs_send"] = False
+                save_tasks(tasks_today)
+                log.info(f"task#{task_id}: scheduled send cancelled")
+                return {"status": "ok", "task_id": task_id}
+            raise HTTPException(status_code=400, detail="task is not scheduled")
+    raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
+
+
+@app.get("/api/internal/tasks/scheduled")
+async def list_tasks_scheduled_due(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 24: scheduler poll'ит scheduled задачи. Возвращаем только те,
+    у которых scheduled_at <= now (пора отправлять)."""
+    check_internal(authorization)
+    now = datetime.now(timezone.utc)
+    due = []
+    for t in tasks_today.get("tasks") or []:
+        pend = t.get("pending_send") or {}
+        if pend.get("status") != "scheduled":
+            continue
+        sched = pend.get("scheduled_at")
+        if not sched:
+            continue
+        try:
+            dt = datetime.fromisoformat(sched.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if dt <= now:
+            due.append(t)
+    return {"count": len(due), "tasks": due}
+
+
 @app.get("/api/internal/tasks/needs_send")
 async def list_tasks_needs_send(
     authorization: Optional[str] = Header(default=None),
