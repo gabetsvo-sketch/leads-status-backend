@@ -771,6 +771,31 @@ async def ack_lead(
     raise HTTPException(status_code=404, detail="lead not found")
 
 
+@app.post("/api/internal/leads/{lead_id}/silent_ack")
+async def silent_ack_lead(
+    lead_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 28.3: ack лида БЕЗ запроса смены статуса в AmoCRM.
+    Используется scheduler `_prune_stale_leads` для скрытия из iOS-inbox
+    лидов которые УЖЕ ушли из стартовой стадии (Vladimir/Rustem перевели
+    в воронке → не нужно переводить ещё раз).
+
+    Vladimir 2026-05-02: re-process через last_ts reset вызвал
+    непредвиденную автозадачу AmoCRM Salesbot — потому что prune
+    использовал обычный /ack который теперь ставит pending_status_change.
+    Этот endpoint решает проблему: status в AmoCRM не трогаем."""
+    check_internal(authorization)
+    for L in leads_inbox:
+        if L.get("lead_id") == lead_id:
+            L["acked"] = True
+            L["acked_at"] = datetime.now(timezone.utc).isoformat()
+            L["ack_source"] = "prune"
+            save_leads(leads_inbox)
+            return {"status": "ok", "lead_id": lead_id}
+    raise HTTPException(status_code=404, detail="lead not found")
+
+
 @app.get("/api/internal/leads/needs_status_change")
 async def list_leads_needs_status_change(
     authorization: Optional[str] = Header(default=None),
