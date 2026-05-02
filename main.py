@@ -581,10 +581,46 @@ async def internal_lead(
     if not lead_id:
         raise HTTPException(status_code=400, detail="lead_id required")
 
-    # Дедуп по lead_id
-    if any(L.get("lead_id") == lead_id for L in leads_inbox):
-        log.info(f"lead #{lead_id} already in inbox — skipping")
-        return {"status": "duplicate", "lead_id": lead_id}
+    # Build 27: для существующего лида merge'им расширенные поля если они
+    # пришли (client_tz_*, telegram_username, preferred_channel, request_text,
+    # custom_fields, start_message). НЕ затираем acked/seen/timer_* — это
+    # user-side state. Это позволяет «починить» старые лиды без удаления.
+    for L in leads_inbox:
+        if L.get("lead_id") == lead_id:
+            mergeable = (
+                "client_city", "client_tz_offset_min", "client_tz_label",
+                "telegram_username", "preferred_channel", "request_text",
+                "custom_fields",
+            )
+            updated = False
+            for k in mergeable:
+                v = payload.get(k)
+                if v not in (None, "", []) and L.get(k) in (None, "", []):
+                    L[k] = v
+                    updated = True
+            # Также если scheduler сгенерил свежий start_message, а timer_3min_text
+            # пуст или auto-fallback — обновим. Если Vladimir уже видел свой
+            # текст (любой непустой), не трогаем.
+            sm = (payload.get("start_message") or "").strip()
+            if sm and not (L.get("timer_3min_text") or "").strip():
+                L["timer_3min_text"] = sm
+                L["timer_3min_sent"] = True
+                L["timer_3min_at"] = datetime.now(timezone.utc).isoformat()
+                updated = True
+            # Если телефон / имя в первичном payload отсутствовали (из-за
+            # старого scheduler без contact_phone) — допишем при появлении.
+            if (not L.get("phone")) and payload.get("phone"):
+                L["phone"] = payload["phone"]
+                updated = True
+            if (not L.get("name")) and payload.get("name"):
+                L["name"] = payload["name"]
+                updated = True
+            if updated:
+                save_leads(leads_inbox)
+                log.info(f"lead #{lead_id} merged extended fields (already in inbox)")
+            else:
+                log.info(f"lead #{lead_id} already in inbox — skipping")
+            return {"status": "duplicate", "lead_id": lead_id, "merged": updated}
 
     received_at = datetime.now(timezone.utc).isoformat()
     entry = {
