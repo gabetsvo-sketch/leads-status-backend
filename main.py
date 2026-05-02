@@ -771,6 +771,38 @@ async def ack_lead(
     raise HTTPException(status_code=404, detail="lead not found")
 
 
+@app.post("/api/triggers/force_refresh")
+async def trigger_force_refresh(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 29: iOS pull-to-refresh запрашивает Mac scheduler сделать
+    force_check_new_leads (свежий polling AmoCRM сейчас, не ждать 30s tick).
+    Backend пишет timestamp в /var/data/refresh_request.json — Mac scheduler
+    polling этот файл и при новом timestamp дёргает _check_new_leads."""
+    check_token(authorization)
+    f = Path(os.environ.get("REFRESH_REQUEST_FILE", "/var/data/refresh_request.json"))
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({"requested_at": datetime.now(timezone.utc).isoformat()}))
+    return {"status": "ok"}
+
+
+@app.get("/api/internal/triggers/refresh_request")
+async def get_refresh_request(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 29: Mac scheduler poll'ит этот endpoint каждые 5 сек и если
+    timestamp обновился — запускает force_check_new_leads. Альтернатива
+    file-trigger (который не доступен с Render → Mac)."""
+    check_internal(authorization)
+    f = Path(os.environ.get("REFRESH_REQUEST_FILE", "/var/data/refresh_request.json"))
+    if not f.exists():
+        return {"requested_at": None}
+    try:
+        return json.loads(f.read_text())
+    except Exception:
+        return {"requested_at": None}
+
+
 @app.post("/api/internal/leads/{lead_id}/silent_ack")
 async def silent_ack_lead(
     lead_id: int,
@@ -1266,21 +1298,22 @@ async def task_sent(
     target["pending_send"] = pend
     target["needs_send"] = False
 
-    # Build 26: после успешной отправки задача перемещается в completed_today.
-    # Vladimir 2026-05-02: «после выполнения задачи карточка должна исчезнуть
-    # из общего списка». Раньше задача оставалась active в action_state=
-    # awaiting_reply — Vladimir видел уже отработанные карточки в «Сегодня».
+    # Build 29: после успешной отправки задача ОСТАЁТСЯ active с
+    # action_state="awaiting_reply" — iOS подсветит её зелёной рамкой
+    # («работа началась, ждём ответ клиента»). В completed_today задача
+    # уезжает только когда:
+    #   1. client_replied_at — клиент ответил (см. /api/internal/tasks/{id}/client_replied)
+    #   2. close_no_followup — Vladimir сам закрыл
+    #   3. task_status_worker увидел is_completed в AmoCRM
+    # Vladimir 2026-05-02: «зелёная рамка горит до момента, пока клиент не
+    # ответит на первое сообщение, которое я отправил сегодня». Build 26 fix
+    # «сразу в completed» эту семантику ломал.
     if success:
-        target["closed_at"] = datetime.now(timezone.utc).isoformat()
-        target["close_method"] = "sent_manually" if prior_status == "sent_manually" else "sent"
-        target["action_state"] = "sent"
-        remaining = [t for t in (tasks_today.get("tasks") or []) if t.get("task_id") != task_id]
-        tasks_today["tasks"] = remaining
-        tasks_today.setdefault("completed_today", []).append(target)
-        _prune_completed_today(tasks_today)
+        target["action_state"] = "awaiting_reply"
+        target["awaiting_since"] = datetime.now(timezone.utc).isoformat()
 
     save_tasks(tasks_today)
-    log.info(f"task#{task_id}: send {pend.get('status')} (analysis={'+' if edit_analysis else '-'}, prior={prior_status}, moved_to_completed={success})")
+    log.info(f"task#{task_id}: send {pend.get('status')} (analysis={'+' if edit_analysis else '-'}, prior={prior_status}, awaiting_reply={success})")
     return {"status": "ok", "task_id": task_id}
 
 
@@ -1394,7 +1427,10 @@ async def task_mark_sent_manually(
     needs_analysis = is_edited
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    target["action_state"] = "sent"  # build 26: было awaiting_reply, теперь sent (карточка едет в completed)
+    # Build 29: возврат к awaiting_reply — задача остаётся active с зелёной
+    # рамкой в iOS до ответа клиента или ручного закрытия. См. comment в /sent.
+    target["action_state"] = "awaiting_reply"
+    target["awaiting_since"] = now_iso
     pend = target.get("pending_send") or {}
     pend["status"] = "sent_manually"
     pend["completed_at"] = now_iso
@@ -1405,22 +1441,10 @@ async def task_mark_sent_manually(
         pend["manual_note"] = note
     target["pending_send"] = pend
     # Если редактировал — флагим для send_worker'а, чтобы тот сделал edit_analysis.
-    # Если is_edited=False — оставляем needs_send=False, сразу перемещаем в completed.
     target["needs_send"] = needs_analysis
 
-    # Build 26: если редактирования нет — сразу в completed_today. Если есть —
-    # оставляем active с needs_send=True, scheduler сделает edit_analysis и через
-    # /sent сам переместит в completed_today.
-    if not needs_analysis:
-        target["closed_at"] = now_iso
-        target["close_method"] = "sent_manually"
-        remaining = [t for t in (tasks_today.get("tasks") or []) if t.get("task_id") != task_id]
-        tasks_today["tasks"] = remaining
-        tasks_today.setdefault("completed_today", []).append(target)
-        _prune_completed_today(tasks_today)
-
     save_tasks(tasks_today)
-    log.info(f"task#{task_id}: marked sent_manually (edited={is_edited}, immediate_move={not needs_analysis})")
+    log.info(f"task#{task_id}: marked sent_manually → awaiting_reply (edited={is_edited})")
     return {"status": "ok", "task_id": task_id, "needs_analysis": is_edited}
 
 
