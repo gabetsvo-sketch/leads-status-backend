@@ -612,8 +612,12 @@ async def internal_lead(
             if (not L.get("phone")) and payload.get("phone"):
                 L["phone"] = payload["phone"]
                 updated = True
-            if (not L.get("name")) and payload.get("name"):
-                L["name"] = payload["name"]
+            # Build 27.1: обновляем name всегда если scheduler прислал другое
+            # значение — он применяет _transliterate_name (Pavel → Павел).
+            # Без этого старые лиды навсегда оставались с латинским именем.
+            new_name = (payload.get("name") or "").strip()
+            if new_name and new_name != (L.get("name") or "").strip():
+                L["name"] = new_name
                 updated = True
             if updated:
                 save_leads(leads_inbox)
@@ -748,13 +752,55 @@ async def ack_lead(
     lead_id: int,
     authorization: Optional[str] = Header(default=None),
 ):
-    """Пометить лид как обработанный (iOS показал / assistant записал в vault)."""
+    """Пометить лид как обработанный + Build 28: запросить смену статуса
+    в AmoCRM на «Взят в работу». Vladimir 2026-05-02: «свайп-вправо =
+    взял в работу, должно меняться в CRM». Mac scheduler через 30 сек
+    подхватит флаг и сделает API patch."""
     check_token(authorization)
     for L in leads_inbox:
         if L.get("lead_id") == lead_id:
             L["acked"] = True
             L["acked_at"] = datetime.now(timezone.utc).isoformat()
+            # Build 28: пометить для scheduler — нужно перевести в AmoCRM
+            # status_id=STATUS_V_RABOTE (82910594). Scheduler сделает API patch
+            # при следующем polling, отчитается через /status_changed.
+            if not L.get("status_changed"):
+                L["pending_status_change"] = "v_rabote"
             save_leads(leads_inbox)
+            return {"status": "ok", "lead_id": lead_id}
+    raise HTTPException(status_code=404, detail="lead not found")
+
+
+@app.get("/api/internal/leads/needs_status_change")
+async def list_leads_needs_status_change(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 28: scheduler poll'ит лидов с pending_status_change."""
+    check_internal(authorization)
+    items = [L for L in leads_inbox if L.get("pending_status_change")]
+    return {"count": len(items), "leads": items}
+
+
+@app.post("/api/internal/leads/{lead_id}/status_changed")
+async def lead_status_changed(
+    lead_id: int,
+    payload: dict = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 28: scheduler рапортует что статус в AmoCRM поменян."""
+    check_internal(authorization)
+    success = bool(payload.get("success", True))
+    error = (payload.get("error") or "").strip()
+    for L in leads_inbox:
+        if L.get("lead_id") == lead_id:
+            L["pending_status_change"] = None
+            if success:
+                L["status_changed"] = True
+                L["status_changed_at"] = datetime.now(timezone.utc).isoformat()
+            elif error:
+                L["status_change_error"] = error
+            save_leads(leads_inbox)
+            log.info(f"lead#{lead_id}: status_changed reported success={success}")
             return {"status": "ok", "lead_id": lead_id}
     raise HTTPException(status_code=404, detail="lead not found")
 
