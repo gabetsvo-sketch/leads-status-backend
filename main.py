@@ -598,7 +598,23 @@ async def internal_lead(
         "created_at": payload.get("created_at", ""),
         "received_at": received_at,
         "acked": False,  # iOS отметит после показа; assistant — после записи в vault
+        # Build 26: расширенные поля для UX iOS
+        "client_city": payload.get("client_city", ""),
+        "client_tz_offset_min": payload.get("client_tz_offset_min"),
+        "client_tz_label": payload.get("client_tz_label", ""),
+        "telegram_username": payload.get("telegram_username", ""),
+        "preferred_channel": payload.get("preferred_channel", ""),  # "telegram"|"whatsapp"|""
+        "request_text": payload.get("request_text", ""),  # что клиент написал в первичной заявке
+        "custom_fields": payload.get("custom_fields") or [],  # все поля из AmoCRM как [{name,value}]
     }
+    # Build 26: scheduler передал стартовое сообщение (Claude + playbook/wiki).
+    # Используем его вместо fallback простого prompt в timer_loop — сообщение
+    # уже сгенерено с полной базой знаний.
+    sm = (payload.get("start_message") or "").strip()
+    if sm:
+        entry["timer_3min_text"] = sm
+        entry["timer_3min_sent"] = True  # не запускаем timer_loop fallback
+        entry["timer_3min_at"] = received_at
     leads_inbox.insert(0, entry)
     # Trim
     while len(leads_inbox) > LEADS_RETENTION:
@@ -721,6 +737,69 @@ async def unack_lead(
             L["acked"] = False
             L.pop("acked_at", None)
             save_leads(leads_inbox)
+            return {"status": "ok", "lead_id": lead_id}
+    raise HTTPException(status_code=404, detail="lead not found")
+
+
+@app.post("/api/leads/{lead_id}/feedback")
+async def lead_feedback(
+    lead_id: int,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 26: feedback на стартовое сообщение нового лида. Vladimir пишет
+    что не нравится → backend ставит regen_feedback + needs_regen=True →
+    Mac scheduler `_lead_regen_worker_loop` подхватит, регенерирует через
+    Claude (с playbook/wiki/style) и POST'ит обновлённый текст в timer_3min_text.
+    """
+    check_token(authorization)
+    fb = (payload.get("feedback") or "").strip()
+    current_draft = (payload.get("current_draft") or "").strip()
+    if not fb:
+        raise HTTPException(status_code=400, detail="feedback empty")
+    for L in leads_inbox:
+        if L.get("lead_id") == lead_id:
+            L["regen_feedback"] = fb
+            L["regen_current_draft"] = current_draft
+            L["needs_regen"] = True
+            L["regen_requested_at"] = datetime.now(timezone.utc).isoformat()
+            save_leads(leads_inbox)
+            log.info(f"lead#{lead_id}: regen requested ({len(fb)} chars feedback)")
+            return {"status": "ok", "lead_id": lead_id}
+    raise HTTPException(status_code=404, detail="lead not found")
+
+
+@app.get("/api/internal/leads/needs_regen")
+async def list_leads_needs_regen(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 26: scheduler poll'ит лидов с needs_regen=True для regenerate."""
+    check_internal(authorization)
+    items = [L for L in leads_inbox if L.get("needs_regen")]
+    return {"count": len(items), "leads": items}
+
+
+@app.post("/api/internal/leads/{lead_id}/regenerated")
+async def lead_regenerated(
+    lead_id: int,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Build 26: scheduler рапортует что regen завершён. Body: {start_message, error?}."""
+    check_internal(authorization)
+    new_text = (payload.get("start_message") or "").strip()
+    error = (payload.get("error") or "").strip()
+    for L in leads_inbox:
+        if L.get("lead_id") == lead_id:
+            if new_text:
+                L["timer_3min_text"] = new_text
+                L["timer_3min_sent"] = True  # помечаем что текст уже сгенерён
+            L["needs_regen"] = False
+            L["regen_completed_at"] = datetime.now(timezone.utc).isoformat()
+            if error:
+                L["regen_error"] = error
+            save_leads(leads_inbox)
+            log.info(f"lead#{lead_id}: regen completed ({len(new_text)} chars)")
             return {"status": "ok", "lead_id": lead_id}
     raise HTTPException(status_code=404, detail="lead not found")
 
@@ -1069,21 +1148,32 @@ async def task_sent(
     pend = target.get("pending_send") or {}
     prior_status = pend.get("status")
     # Не затираем sent_manually — Vladimir уже сам отправил, scheduler только
-    # делал edit_analysis. Сохраняем sent_manually-статус и awaiting_since.
+    # делал edit_analysis. Сохраняем sent_manually-статус.
     if prior_status != "sent_manually":
         pend["status"] = "sent" if success else "failed"
         pend["completed_at"] = datetime.now(timezone.utc).isoformat()
-        if success:
-            target["action_state"] = "awaiting_reply"
-            target["awaiting_since"] = pend["completed_at"]
     if error:
         pend["error"] = error
     if edit_analysis:
         pend["edit_analysis"] = edit_analysis
     target["pending_send"] = pend
     target["needs_send"] = False
+
+    # Build 26: после успешной отправки задача перемещается в completed_today.
+    # Vladimir 2026-05-02: «после выполнения задачи карточка должна исчезнуть
+    # из общего списка». Раньше задача оставалась active в action_state=
+    # awaiting_reply — Vladimir видел уже отработанные карточки в «Сегодня».
+    if success:
+        target["closed_at"] = datetime.now(timezone.utc).isoformat()
+        target["close_method"] = "sent_manually" if prior_status == "sent_manually" else "sent"
+        target["action_state"] = "sent"
+        remaining = [t for t in (tasks_today.get("tasks") or []) if t.get("task_id") != task_id]
+        tasks_today["tasks"] = remaining
+        tasks_today.setdefault("completed_today", []).append(target)
+        _prune_completed_today(tasks_today)
+
     save_tasks(tasks_today)
-    log.info(f"task#{task_id}: send {pend.get('status')} (analysis={'+' if edit_analysis else '-'}, prior={prior_status})")
+    log.info(f"task#{task_id}: send {pend.get('status')} (analysis={'+' if edit_analysis else '-'}, prior={prior_status}, moved_to_completed={success})")
     return {"status": "ok", "task_id": task_id}
 
 
@@ -1197,8 +1287,7 @@ async def task_mark_sent_manually(
     needs_analysis = is_edited
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    target["action_state"] = "awaiting_reply"
-    target["awaiting_since"] = now_iso
+    target["action_state"] = "sent"  # build 26: было awaiting_reply, теперь sent (карточка едет в completed)
     pend = target.get("pending_send") or {}
     pend["status"] = "sent_manually"
     pend["completed_at"] = now_iso
@@ -1208,11 +1297,23 @@ async def task_mark_sent_manually(
     if note:
         pend["manual_note"] = note
     target["pending_send"] = pend
-    # Если редактировал — флагим для send_worker'а, чтобы тот сделал edit_analysis
-    # (без реальной отправки через Wazzup, т.к. status=sent_manually).
+    # Если редактировал — флагим для send_worker'а, чтобы тот сделал edit_analysis.
+    # Если is_edited=False — оставляем needs_send=False, сразу перемещаем в completed.
     target["needs_send"] = needs_analysis
+
+    # Build 26: если редактирования нет — сразу в completed_today. Если есть —
+    # оставляем active с needs_send=True, scheduler сделает edit_analysis и через
+    # /sent сам переместит в completed_today.
+    if not needs_analysis:
+        target["closed_at"] = now_iso
+        target["close_method"] = "sent_manually"
+        remaining = [t for t in (tasks_today.get("tasks") or []) if t.get("task_id") != task_id]
+        tasks_today["tasks"] = remaining
+        tasks_today.setdefault("completed_today", []).append(target)
+        _prune_completed_today(tasks_today)
+
     save_tasks(tasks_today)
-    log.info(f"task#{task_id}: marked sent_manually (edited={is_edited}, len={len(edited)})")
+    log.info(f"task#{task_id}: marked sent_manually (edited={is_edited}, immediate_move={not needs_analysis})")
     return {"status": "ok", "task_id": task_id, "needs_analysis": is_edited}
 
 
