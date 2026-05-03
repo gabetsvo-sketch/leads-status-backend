@@ -20,6 +20,33 @@ logging.basicConfig(
 )
 log = logging.getLogger("leads_status")
 
+# Этап 4.2: Sentry production monitoring (opt-in через env SENTRY_DSN).
+# Inline init (а не import из assistant/sentry_helper.py) — backend деплоится
+# на Render отдельно, не имеет доступа к assistant/ репо.
+_sentry_dsn = os.environ.get("SENTRY_DSN", "").strip()
+if _sentry_dsn:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.logging import LoggingIntegration
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+
+        sentry_sdk.init(
+            dsn=_sentry_dsn,
+            environment=os.environ.get("SENTRY_ENV", "production"),
+            release=os.environ.get("BACKEND_RELEASE", "dev"),
+            integrations=[
+                LoggingIntegration(level=logging.WARNING, event_level=logging.ERROR),
+                FastApiIntegration(),
+            ],
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0")),
+            send_default_pii=False,
+            max_value_length=2048,
+        )
+        sentry_sdk.set_tag("component", "backend")
+        log.info("sentry: активен (component=backend)")
+    except ImportError:
+        log.warning("sentry: SENTRY_DSN задан, но sentry-sdk не установлен")
+
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 CHAT_ID = int(os.environ["TG_CHAT_ID"])
@@ -35,6 +62,7 @@ INSTRUCTIONS_FILE = Path(os.environ.get("INSTRUCTIONS_FILE", "instructions.json"
 ANTHROPIC_HEALTH_FILE = Path(os.environ.get("ANTHROPIC_HEALTH_FILE", "anthropic_health.json"))
 NEWS_FILE = Path(os.environ.get("NEWS_FILE", "news.json"))
 DEVICES_FILE = Path(os.environ.get("DEVICES_FILE", "devices.json"))
+SCHEDULER_HEARTBEAT_FILE = Path(os.environ.get("SCHEDULER_HEARTBEAT_FILE", "/var/data/scheduler_heartbeat.json"))
 
 # APNs config (build 20). Файл .p8 либо лежит на диске (APNS_AUTH_KEY_FILE),
 # либо передаётся целиком через env (APNS_AUTH_KEY_CONTENT) — для Render.
@@ -585,8 +613,22 @@ async def internal_lead(
     # пришли (client_tz_*, telegram_username, preferred_channel, request_text,
     # custom_fields, start_message). НЕ затираем acked/seen/timer_* — это
     # user-side state. Это позволяет «починить» старые лиды без удаления.
+    #
+    # Build 33 (2026-05-03): re-activation. Если scheduler пометил
+    # `is_active_stage=true` (лид сейчас в одной из 2 стартовых стадий
+    # pipeline) И в backend он уже acked=True → СБРОСИТЬ acked+seen, чтобы
+    # лид снова появился в iOS. Это бывает когда AmoCRM Salesbot или коллега
+    # вернул лид обратно в «Новый лид» после нашего ack'а — он опять стал
+    # «новой заявкой» с нашей точки зрения. Инцидент с Бирутой 2026-05-03.
+    is_active_stage = bool(payload.get("is_active_stage"))
     for L in leads_inbox:
         if L.get("lead_id") == lead_id:
+            if is_active_stage and L.get("acked"):
+                L["acked"] = False
+                L["seen"] = False
+                L.pop("acked_at", None)
+                save_leads(leads_inbox)
+                log.info(f"lead #{lead_id} re-activated (вернулся в стартовую стадию AmoCRM)")
             mergeable = (
                 "client_city", "client_tz_offset_min", "client_tz_label",
                 "telegram_username", "preferred_channel", "request_text",
@@ -801,6 +843,55 @@ async def get_refresh_request(
         return json.loads(f.read_text())
     except Exception:
         return {"requested_at": None}
+
+
+@app.post("/api/internal/heartbeat")
+async def scheduler_heartbeat(
+    payload: dict = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Этап 1.1: Mac scheduler пишет heartbeat каждые 30 сек.
+    iOS GET /api/health/scheduler определяет online/offline по этому ts.
+    """
+    check_internal(authorization)
+    now = datetime.now(timezone.utc).isoformat()
+    workers = payload.get("workers") or []
+    SCHEDULER_HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SCHEDULER_HEARTBEAT_FILE.write_text(json.dumps({
+        "last_seen": now,
+        "pid": payload.get("pid"),
+        "workers_count": len(workers),
+        "workers": workers,
+    }, ensure_ascii=False))
+    return {"status": "ok"}
+
+
+@app.get("/api/health/scheduler")
+async def get_scheduler_health(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Этап 1.1: iOS опрашивает чтобы показать зелёную/красную точку
+    «Mac jobs: live/offline» рядом со статус-баннером.
+    online = heartbeat был < 90 сек назад."""
+    check_token(authorization)
+    if not SCHEDULER_HEARTBEAT_FILE.exists():
+        return {"online": False, "last_seen": None, "workers_count": 0}
+    try:
+        data = json.loads(SCHEDULER_HEARTBEAT_FILE.read_text())
+        last_seen_iso = data.get("last_seen")
+        if not last_seen_iso:
+            return {"online": False, "last_seen": None, "workers_count": 0}
+        last_seen = datetime.fromisoformat(last_seen_iso.replace("Z", "+00:00"))
+        age_sec = (datetime.now(timezone.utc) - last_seen).total_seconds()
+        return {
+            "online": age_sec < 90,
+            "last_seen": last_seen_iso,
+            "workers_count": data.get("workers_count", 0),
+            "age_sec": int(age_sec),
+        }
+    except Exception as e:
+        log.error(f"scheduler_health: {e}")
+        return {"online": False, "last_seen": None, "workers_count": 0}
 
 
 @app.post("/api/internal/leads/{lead_id}/silent_ack")
@@ -1506,6 +1597,56 @@ async def task_regenerated(
     save_tasks(tasks_today)
     log.info(f"task#{task_id}: regenerated, suggested_message len={len(sug)}")
     return {"status": "ok", "task_id": task_id}
+
+
+@app.get("/api/metrics/feedback_rate")
+async def feedback_rate(
+    weeks: int = Query(8, ge=1, le=52),
+    authorization: Optional[str] = Header(default=None),
+):
+    """«Супермозг» (2026-05-03): метрика обучения для iOS таб «Метрики».
+    Возвращает количество правок Vladimir'а по неделям. Тренд должен идти
+    ВНИЗ по мере того как векторная память делает Claude более точным."""
+    check_token(authorization)
+    fb_file = Path(os.environ.get("FEEDBACK_FILE", "/var/data/task_feedback.jsonl"))
+    if not fb_file.exists():
+        return {"weeks": []}
+    try:
+        items = [json.loads(ln) for ln in fb_file.read_text(encoding="utf-8").strip().splitlines() if ln.strip()]
+    except Exception as e:
+        log.error(f"feedback rate read failed: {e}")
+        return {"weeks": []}
+
+    from collections import Counter
+    counts: Counter = Counter()
+    lengths: dict = {}  # week_start_iso -> [len, len, ...]
+    for it in items:
+        rec_at = it.get("received_at")
+        if not rec_at:
+            continue
+        try:
+            d = datetime.fromisoformat(rec_at.replace("Z", "+00:00")).date()
+        except Exception:
+            continue
+        # начало недели (понедельник)
+        monday = d - timedelta(days=d.weekday())
+        key = monday.isoformat()
+        counts[key] += 1
+        lengths.setdefault(key, []).append(len(it.get("feedback") or ""))
+
+    today = datetime.now(timezone.utc).date()
+    weeks_data = []
+    for i in range(weeks - 1, -1, -1):
+        wstart = today - timedelta(days=today.weekday() + 7 * i)
+        key = wstart.isoformat()
+        ls = lengths.get(key, [])
+        avg_len = round(sum(ls) / len(ls), 1) if ls else 0
+        weeks_data.append({
+            "week_start": key,
+            "feedback_count": counts.get(key, 0),
+            "avg_feedback_length": avg_len,
+        })
+    return {"weeks": weeks_data}
 
 
 @app.get("/api/internal/feedback/recent")
