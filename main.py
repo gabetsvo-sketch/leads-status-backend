@@ -1169,6 +1169,10 @@ async def task_feedback(
         "suggested_message_at_feedback": (task_meta or {}).get("suggested_message"),
         "feedback": feedback,
         "received_at": datetime.now(timezone.utc).isoformat(),
+        # Phase E.2: prompt версия которая генерила этот draft (если scheduler
+        # её прислал в /sent ранее). Дальше можно посчитать feedback_rate
+        # by prompt_version и видеть какая версия prompt'а лучше работает.
+        "prompt_version_at_feedback": (task_meta or {}).get("prompt_version", ""),
     }
 
     # JSONL: одна задача = одна строка, append-only
@@ -1366,6 +1370,11 @@ async def task_sent(
     success = bool(payload.get("success"))
     error = (payload.get("error") or "").strip()
     edit_analysis = (payload.get("edit_analysis") or "").strip()
+    # Phase E.2 (2026-05-03 «Супермозг»): trace prompt_version который был
+    # использован при генерации этого draft'а. Дальше при /feedback на эту
+    # task — мы зашьём prompt_version_at_feedback. Это даёт связку «версия
+    # prompt'а X → сколько правок» для калибровки.
+    prompt_version = (payload.get("prompt_version") or "").strip()
 
     target = None
     for t in tasks_today.get("tasks") or []:
@@ -1386,6 +1395,8 @@ async def task_sent(
         pend["error"] = error
     if edit_analysis:
         pend["edit_analysis"] = edit_analysis
+    if prompt_version:
+        target["prompt_version"] = prompt_version  # для будущего /feedback корреляции
     target["pending_send"] = pend
     target["needs_send"] = False
 
