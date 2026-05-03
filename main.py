@@ -621,6 +621,30 @@ async def internal_lead(
     # вернул лид обратно в «Новый лид» после нашего ack'а — он опять стал
     # «новой заявкой» с нашей точки зрения. Инцидент с Бирутой 2026-05-03.
     is_active_stage = bool(payload.get("is_active_stage"))
+
+    # Build 33.3 (2026-05-03) phone matching: Vladimir 2026-05-03: «для
+    # уникальности сверяться не только с именем, но и с номером телефона».
+    # Если в inbox уже есть лид с ТАКИМ ЖЕ phone (и не пустым) — это тот
+    # же клиент в другой сделке/форме AmoCRM. Защищает от дубликатов в
+    # iOS «Новые заявки» когда клиент написал в 2 формы.
+    incoming_phone = (payload.get("phone") or "").strip()
+    # Нормализуем: только цифры (избегаем +/space/-/() расхождений)
+    def _normalize_phone(p: str) -> str:
+        return "".join(ch for ch in p if ch.isdigit())
+    incoming_phone_norm = _normalize_phone(incoming_phone)
+    if incoming_phone_norm and len(incoming_phone_norm) >= 7:
+        for L in leads_inbox:
+            if L.get("lead_id") == lead_id:
+                continue  # сам с собой не сравниваем
+            existing_phone_norm = _normalize_phone(L.get("phone") or "")
+            if existing_phone_norm == incoming_phone_norm:
+                # Тот же клиент. Если предыдущий лид уже обработан (acked) —
+                # новый тоже считается уже-обработанным (тот же человек).
+                # Если предыдущий не acked — текущий лид также не появится
+                # как «новая заявка» в iOS, чтобы не дублировать.
+                log.info(f"lead #{lead_id} имеет тот же phone что lead #{L['lead_id']} (Бирута/тёзка) — пропускаем как дубль")
+                return {"status": "duplicate_phone", "lead_id": lead_id, "matched_lead_id": L["lead_id"]}
+
     for L in leads_inbox:
         if L.get("lead_id") == lead_id:
             if is_active_stage and L.get("acked"):
@@ -1122,20 +1146,31 @@ async def internal_tasks(
 
 @app.get("/api/tasks/today")
 async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
-    """iOS GET'ит сегодняшний список задач + выполненные за последние 24 часа.
-
-    completed_today показывается в iOS в свёрнутом блоке внизу — Vladimir
-    может развернуть и посмотреть что уже сделано сегодня.
-    """
+    """iOS GET'ит сегодняшний список задач + выполненные за последние 24 часа."""
     check_token(authorization)
-    # Чистим устаревшие completed на read (не на write — чтобы iOS-pull
-    # делал одно и то же даже если scheduler пока не работал).
     _prune_completed_today(tasks_today)
+
+    # Build 33.7 (2026-05-03): подмешиваем `request_text` из leads_inbox по
+    # lead_id. Vladimir хочет видеть «что хочет клиент простым языком» в
+    # карточке задачи. Сейчас scheduler не пушит request_text в task payload,
+    # но он есть в leads_inbox (от _check_new_leads). Делаем enrichment здесь.
+    leads_by_id = {L["lead_id"]: L for L in leads_inbox if L.get("lead_id")}
+    def _enrich(t: dict) -> dict:
+        lid = t.get("lead_id")
+        if not lid or t.get("request_text"):
+            return t
+        L = leads_by_id.get(lid)
+        if L and L.get("request_text"):
+            t = {**t, "request_text": L["request_text"]}
+        return t
+    enriched_tasks = [_enrich(t) for t in (tasks_today.get("tasks") or [])]
+    enriched_completed = [_enrich(t) for t in (tasks_today.get("completed_today") or [])]
+
     return {
-        "count": len(tasks_today.get("tasks") or []),
+        "count": len(enriched_tasks),
         "updated_at": tasks_today.get("updated_at"),
-        "tasks": tasks_today.get("tasks") or [],
-        "completed_today": tasks_today.get("completed_today") or [],
+        "tasks": enriched_tasks,
+        "completed_today": enriched_completed,
     }
 
 
