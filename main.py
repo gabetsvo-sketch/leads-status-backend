@@ -66,6 +66,7 @@ DEVICES_FILE = Path(os.environ.get("DEVICES_FILE", "devices.json"))
 SCHEDULER_HEARTBEAT_FILE = Path(os.environ.get("SCHEDULER_HEARTBEAT_FILE", "/var/data/scheduler_heartbeat.json"))
 OFFICE_TOKEN = os.environ.get("OFFICE_TOKEN", "").strip() or INTERNAL_TOKEN
 OFFICE_DRAFTS_FILE = Path(os.environ.get("OFFICE_DRAFTS_FILE", "/var/data/office_drafts.json"))
+DRAFT_FEEDBACK_LOG = Path(os.environ.get("DRAFT_FEEDBACK_LOG", "/var/data/draft_feedback_log.jsonl"))
 
 # APNs config (build 20). Файл .p8 либо лежит на диске (APNS_AUTH_KEY_FILE),
 # либо передаётся целиком через env (APNS_AUTH_KEY_CONTENT) — для Render.
@@ -248,6 +249,14 @@ def save_office_drafts_atomic(items: list) -> None:
     tmp = OFFICE_DRAFTS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2))
     tmp.replace(OFFICE_DRAFTS_FILE)
+
+
+def _append_draft_feedback_log(entry: dict) -> None:
+    try:
+        with DRAFT_FEEDBACK_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        log.exception("failed to write draft_feedback_log")
 
 
 state = load_state()
@@ -2174,6 +2183,11 @@ async def office_drafts_create(
             "retry_count": 0,
             "next_retry_at": None,
             "expire_reason": None,
+            "original_text": text,
+            "feedback_text": None,
+            "needs_regen": False,
+            "regen_count": 0,
+            "last_feedback_at": None,
         }
         office_drafts.append(draft)
         save_office_drafts_atomic(office_drafts)
@@ -2294,6 +2308,106 @@ async def office_drafts_reject(
 
     log.info("office_draft rejected: draft_id=%s reason=%s", draft_id, (reject_reason or "")[:80])
     return {"status": "ok", "draft_id": draft_id}
+
+
+@app.post("/api/office/drafts/{draft_id}/feedback")
+async def office_drafts_feedback(
+    draft_id: str,
+    payload: dict = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Vladimir submits feedback/comment explaining why he wants a different text.
+    Sets needs_regen=True so scheduler regenerates the draft with this guidance."""
+    check_token(authorization)
+    feedback_text = (payload.get("feedback_text") or "").strip()
+    if not feedback_text:
+        raise HTTPException(status_code=400, detail="feedback_text required")
+    current_text = payload.get("current_text") or ""
+    now = datetime.now(timezone.utc)
+
+    async with _office_drafts_lock:
+        draft = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+        if not draft:
+            raise HTTPException(status_code=404, detail="draft not found")
+        if draft.get("status") in ("approved", "approved_sending", "sent", "dry_run_consumed", "send_failed", "expired"):
+            raise HTTPException(status_code=409, detail=f"draft in non-editable status: {draft['status']}")
+
+        if not draft.get("original_text"):
+            draft["original_text"] = draft.get("text")
+        draft["feedback_text"] = feedback_text
+        draft["needs_regen"] = True
+        draft["last_feedback_at"] = now.isoformat()
+        draft["updated_at"] = now.isoformat()
+        save_office_drafts_atomic(office_drafts)
+
+    _append_draft_feedback_log({
+        "ts": now.isoformat(),
+        "draft_id": draft_id,
+        "entity_id": draft.get("entity_id"),
+        "category": draft.get("category"),
+        "original_text": draft.get("original_text"),
+        "current_text": current_text or draft.get("text"),
+        "feedback_text": feedback_text,
+        "version_before_regen": draft.get("version", 1),
+        "regen_count_before": draft.get("regen_count", 0),
+    })
+
+    log.info("office_draft feedback: draft_id=%s feedback_len=%d", draft_id, len(feedback_text))
+    return {"status": "ok", "draft_id": draft_id, "needs_regen": True}
+
+
+@app.get("/api/internal/office/drafts/needs_regen")
+async def office_drafts_needs_regen(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Regen worker polls drafts that need regeneration based on Vladimir's feedback."""
+    check_office_write(authorization)
+    result = [d for d in office_drafts if d.get("needs_regen") and d.get("status") in ("pending", "rejected")]
+    return {"drafts": result}
+
+
+@app.patch("/api/internal/office/drafts/{draft_id}")
+async def office_drafts_patch(
+    draft_id: str,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Regen worker updates draft text after regeneration."""
+    check_office_write(authorization)
+    now = datetime.now(timezone.utc)
+
+    async with _office_drafts_lock:
+        draft = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+        if not draft:
+            raise HTTPException(status_code=404, detail="draft not found")
+
+        new_text = payload.get("text")
+        if new_text:
+            draft["text"] = new_text
+            draft["version"] = draft.get("version", 1) + 1
+        draft["needs_regen"] = False
+        draft["regen_count"] = draft.get("regen_count", 0) + 1
+        draft["updated_at"] = now.isoformat()
+        if payload.get("status"):
+            draft["status"] = payload["status"]
+        save_office_drafts_atomic(office_drafts)
+
+    log.info("office_draft patched: draft_id=%s version=%s regen_count=%s",
+             draft_id, draft.get("version"), draft.get("regen_count"))
+    return {"status": "ok", "draft_id": draft_id, "version": draft.get("version")}
+
+
+@app.get("/api/office/drafts/{draft_id}")
+async def office_draft_get(
+    draft_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    """iOS polls single draft by id (version check after feedback submit)."""
+    check_token(authorization)
+    draft = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+    if not draft:
+        raise HTTPException(status_code=404, detail="draft not found")
+    return draft
 
 
 @app.get("/api/internal/office/drafts/approved")
