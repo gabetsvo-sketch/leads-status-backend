@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2076,14 +2077,23 @@ async def get_anthropic_health(authorization: Optional[str] = Header(default=Non
 # ---------------------------------------------------------------------------
 # Packet C — Office draft inbox (approval bridge between office pipeline and iOS)
 #
-# POST  /api/office/drafts                      auth: OFFICE_TOKEN — office creates draft
-# GET   /api/office/drafts/pending              auth: WIDGET_TOKEN — iOS reads pending
-# POST  /api/office/drafts/{id}/approve         auth: WIDGET_TOKEN — Vladimir approves
-# POST  /api/office/drafts/{id}/reject          auth: WIDGET_TOKEN — Vladimir rejects
-# GET   /api/internal/office/drafts/approved    auth: OFFICE_TOKEN — send_worker reads approved
+# POST  /api/office/drafts                         auth: OFFICE_TOKEN — office creates draft
+# GET   /api/office/drafts/pending                 auth: WIDGET_TOKEN — iOS reads pending
+# POST  /api/office/drafts/{id}/approve            auth: WIDGET_TOKEN — Vladimir approves
+# POST  /api/office/drafts/{id}/reject             auth: WIDGET_TOKEN — Vladimir rejects
+# GET   /api/internal/office/drafts/approved       auth: OFFICE_TOKEN — send_worker polls approved
+# POST  /api/internal/office/drafts/{id}/claim     auth: OFFICE_TOKEN — send_worker claims draft
+# POST  /api/internal/office/drafts/{id}/consume   auth: OFFICE_TOKEN — send_worker finalises draft
 # ---------------------------------------------------------------------------
 
-_DRAFT_TERMINAL_STATUSES = {"approved", "approved_sending", "rejected", "consumed", "sent"}
+# Statuses that block re-creation of a draft with the same draft_id.
+_DRAFT_TERMINAL_STATUSES = {
+    "approved", "approved_sending",
+    "rejected", "consumed", "sent",
+    "dry_run_consumed", "send_failed", "expired",
+}
+
+_CLAIM_TTL_SECONDS = 600  # 10 minutes
 
 
 @app.post("/api/office/drafts")
@@ -2155,8 +2165,15 @@ async def office_drafts_create(
             "reject_reason": None,
             "push_sent_count": 0,
             "consumed_at": None,
+            "consumed_by_scheduler_at": None,
             "send_trace_id": None,
             "send_status": None,
+            "claimed_at": None,
+            "claimed_by": None,
+            "claim_expires_at": None,
+            "retry_count": 0,
+            "next_retry_at": None,
+            "expire_reason": None,
         }
         office_drafts.append(draft)
         save_office_drafts_atomic(office_drafts)
@@ -2219,7 +2236,7 @@ async def office_drafts_approve(
             if approval_id and draft.get("approval_id") == approval_id:
                 return {"status": "ok", "idempotent": True}
             raise HTTPException(status_code=409, detail="draft already approved")
-        if draft.get("status") in ("rejected", "consumed", "sent"):
+        if draft.get("status") in ("rejected", "consumed", "sent", "dry_run_consumed", "send_failed", "expired"):
             raise HTTPException(status_code=409, detail=f"draft in terminal status: {draft['status']}")
 
         try:
@@ -2283,10 +2300,127 @@ async def office_drafts_reject(
 async def office_drafts_approved_internal(
     authorization: Optional[str] = Header(default=None),
 ):
-    """Office send_worker reads approved (not yet consumed) drafts for final gate + send."""
+    """Office send_worker polls approved drafts. Also returns approved_sending with expired lease."""
     check_office_write(authorization)
-    result = [d for d in office_drafts if d.get("status") == "approved"]
+    now = datetime.now(timezone.utc)
+    result = []
+    for d in office_drafts:
+        if d.get("status") == "approved":
+            result.append(d)
+        elif d.get("status") == "approved_sending":
+            exp_raw = d.get("claim_expires_at")
+            if exp_raw:
+                try:
+                    exp = datetime.fromisoformat(exp_raw)
+                    if exp <= now:
+                        result.append(d)
+                except Exception:
+                    pass
+    result.sort(key=lambda x: x.get("approved_at") or "")
     return {"drafts": result}
+
+
+@app.post("/api/internal/office/drafts/{draft_id}/claim")
+async def office_drafts_claim(
+    draft_id: str,
+    payload: dict = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Scheduler atomically claims an approved draft before send (approved → approved_sending)."""
+    check_office_write(authorization)
+    claimed_by = payload.get("claimed_by", "scheduler")
+    now = datetime.now(timezone.utc)
+    claim_expires = now + timedelta(seconds=_CLAIM_TTL_SECONDS)
+
+    async with _office_drafts_lock:
+        draft = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+        if not draft:
+            raise HTTPException(status_code=404, detail="draft not found")
+
+        status = draft.get("status")
+
+        if status == "approved_sending":
+            exp_raw = draft.get("claim_expires_at")
+            lease_expired = True
+            if exp_raw:
+                try:
+                    lease_expired = datetime.fromisoformat(exp_raw) <= now
+                except Exception:
+                    pass
+            if not lease_expired:
+                raise HTTPException(status_code=409, detail="draft already claimed by another worker")
+            # Lease expired — re-claim
+            log.info("office_draft claim: re-claiming expired lease draft_id=%s", draft_id)
+
+        elif status != "approved":
+            raise HTTPException(status_code=409, detail=f"draft not claimable (status={status})")
+
+        send_trace_id = str(uuid.uuid4())
+        draft["status"] = "approved_sending"
+        draft["claimed_at"] = now.isoformat()
+        draft["claimed_by"] = claimed_by
+        draft["claim_expires_at"] = claim_expires.isoformat()
+        draft["send_trace_id"] = send_trace_id
+        draft["updated_at"] = now.isoformat()
+        save_office_drafts_atomic(office_drafts)
+
+    log.info("office_draft claimed: draft_id=%s trace=%s by=%s", draft_id, send_trace_id, claimed_by)
+    return {"ok": True, "send_trace_id": send_trace_id}
+
+
+@app.post("/api/internal/office/drafts/{draft_id}/consume")
+async def office_drafts_consume(
+    draft_id: str,
+    payload: dict = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Scheduler finalises a claimed draft: sent / dry_run_consumed / send_failed / expired."""
+    check_office_write(authorization)
+    send_trace_id = payload.get("send_trace_id")
+    send_status = payload.get("send_status")  # "sent" | "dry_run" | "failed" | "expired"
+    expire_reason = payload.get("expire_reason")
+
+    if send_status not in ("sent", "dry_run", "failed", "expired"):
+        raise HTTPException(status_code=400, detail="send_status must be sent|dry_run|failed|expired")
+
+    status_map = {
+        "sent": "sent",
+        "dry_run": "dry_run_consumed",
+        "failed": "send_failed",
+        "expired": "expired",
+    }
+    final_status = status_map[send_status]
+    now = datetime.now(timezone.utc)
+
+    async with _office_drafts_lock:
+        draft = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+        if not draft:
+            raise HTTPException(status_code=404, detail="draft not found")
+
+        current_status = draft.get("status")
+
+        # Idempotency: already in a terminal state with same trace_id
+        if current_status == final_status and draft.get("send_trace_id") == send_trace_id:
+            return {"ok": True, "idempotent": True}
+
+        if current_status not in ("approved_sending", "approved"):
+            raise HTTPException(status_code=409, detail=f"draft not consumable (status={current_status})")
+
+        if send_trace_id and draft.get("send_trace_id") and draft["send_trace_id"] != send_trace_id:
+            raise HTTPException(status_code=409, detail="send_trace_id mismatch (claimed by different worker)")
+
+        draft["status"] = final_status
+        draft["consumed_at"] = now.isoformat()
+        draft["consumed_by_scheduler_at"] = now.isoformat()
+        draft["send_status"] = send_status
+        if expire_reason:
+            draft["expire_reason"] = expire_reason
+        draft["updated_at"] = now.isoformat()
+        save_office_drafts_atomic(office_drafts)
+
+    log.info("office_draft consumed: draft_id=%s final_status=%s trace=%s",
+             draft_id, final_status, send_trace_id)
+    return {"ok": True, "draft_id": draft_id, "status": final_status}
 
 
 if __name__ == "__main__":
