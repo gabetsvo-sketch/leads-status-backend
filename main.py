@@ -63,6 +63,8 @@ ANTHROPIC_HEALTH_FILE = Path(os.environ.get("ANTHROPIC_HEALTH_FILE", "anthropic_
 NEWS_FILE = Path(os.environ.get("NEWS_FILE", "news.json"))
 DEVICES_FILE = Path(os.environ.get("DEVICES_FILE", "devices.json"))
 SCHEDULER_HEARTBEAT_FILE = Path(os.environ.get("SCHEDULER_HEARTBEAT_FILE", "/var/data/scheduler_heartbeat.json"))
+OFFICE_TOKEN = os.environ.get("OFFICE_TOKEN", "").strip() or INTERNAL_TOKEN
+OFFICE_DRAFTS_FILE = Path(os.environ.get("OFFICE_DRAFTS_FILE", "/var/data/office_drafts.json"))
 
 # APNs config (build 20). Файл .p8 либо лежит на диске (APNS_AUTH_KEY_FILE),
 # либо передаётся целиком через env (APNS_AUTH_KEY_CONTENT) — для Render.
@@ -232,6 +234,21 @@ def save_devices(items: list) -> None:
     DEVICES_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2))
 
 
+def load_office_drafts() -> list:
+    if OFFICE_DRAFTS_FILE.exists():
+        try:
+            return json.loads(OFFICE_DRAFTS_FILE.read_text())
+        except Exception:
+            log.exception("failed to load office_drafts, starting empty")
+    return []
+
+
+def save_office_drafts_atomic(items: list) -> None:
+    tmp = OFFICE_DRAFTS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2))
+    tmp.replace(OFFICE_DRAFTS_FILE)
+
+
 state = load_state()
 leads_inbox: list = load_leads()  # most-recent-first
 tasks_today: dict = load_tasks()  # {"updated_at": iso, "tasks": [...]}
@@ -239,6 +256,8 @@ news_inbox: list = load_news()    # [{id, url, title, ..., status}, ...]
 instructions_log: list = load_instructions()  # [{id, text, status, created_at, applied_at, result}, ...]
 anthropic_health: dict = load_anthropic_health()
 devices_registry: list = load_devices()
+office_drafts: list = load_office_drafts()
+_office_drafts_lock = asyncio.Lock()
 client: Optional[TelegramClient] = None
 _apns_client = None  # lazy-init
 
@@ -514,6 +533,13 @@ def check_internal(authorization: Optional[str]) -> None:
         raise HTTPException(status_code=503, detail="INTERNAL_TOKEN not configured")
     if authorization != f"Bearer {INTERNAL_TOKEN}":
         raise HTTPException(status_code=401, detail="unauthorized (internal)")
+
+
+def check_office_write(authorization: Optional[str]) -> None:
+    if not OFFICE_TOKEN:
+        raise HTTPException(status_code=503, detail="OFFICE_TOKEN/INTERNAL_TOKEN not configured")
+    if authorization != f"Bearer {OFFICE_TOKEN}":
+        raise HTTPException(status_code=401, detail="unauthorized (office)")
 
 
 @app.get("/health")
@@ -2045,6 +2071,222 @@ async def get_anthropic_health(authorization: Optional[str] = Header(default=Non
         "last_balance_error_at": last_err,
         "last_ok_at": last_ok,
     }
+
+
+# ---------------------------------------------------------------------------
+# Packet C — Office draft inbox (approval bridge between office pipeline and iOS)
+#
+# POST  /api/office/drafts                      auth: OFFICE_TOKEN — office creates draft
+# GET   /api/office/drafts/pending              auth: WIDGET_TOKEN — iOS reads pending
+# POST  /api/office/drafts/{id}/approve         auth: WIDGET_TOKEN — Vladimir approves
+# POST  /api/office/drafts/{id}/reject          auth: WIDGET_TOKEN — Vladimir rejects
+# GET   /api/internal/office/drafts/approved    auth: OFFICE_TOKEN — send_worker reads approved
+# ---------------------------------------------------------------------------
+
+_DRAFT_TERMINAL_STATUSES = {"approved", "approved_sending", "rejected", "consumed", "sent"}
+
+
+@app.post("/api/office/drafts")
+async def office_drafts_create(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Office pipeline pushes a draft for Vladimir to approve on iPhone."""
+    check_office_write(authorization)
+
+    draft_id = payload.get("draft_id")
+    if not draft_id:
+        raise HTTPException(status_code=400, detail="draft_id required")
+    text = payload.get("text")
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    entity_id = payload.get("entity_id")
+    if not entity_id:
+        raise HTTPException(status_code=400, detail="entity_id required")
+    expires_at_raw = payload.get("expires_at")
+    if not expires_at_raw:
+        raise HTTPException(status_code=400, detail="expires_at required")
+    try:
+        datetime.fromisoformat(expires_at_raw.replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="expires_at must be ISO8601")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    async with _office_drafts_lock:
+        existing = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+        if existing:
+            if existing.get("status") in _DRAFT_TERMINAL_STATUSES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"draft already in terminal status: {existing['status']}",
+                )
+            existing["text"] = text
+            existing["entity_id"] = entity_id
+            existing["expires_at"] = expires_at_raw
+            existing["updated_at"] = now_iso
+            existing["version"] = existing.get("version", 1) + 1
+            for field in ("category", "incoming_msg_id", "context_watermark", "created_by_role", "trace_id"):
+                if field in payload:
+                    existing[field] = payload[field]
+            save_office_drafts_atomic(office_drafts)
+            log.info("office_draft update: draft_id=%s version=%s", draft_id, existing["version"])
+            return {"status": "updated", "draft_id": draft_id, "version": existing["version"]}
+
+        draft = {
+            "draft_id": draft_id,
+            "entity_id": entity_id,
+            "text": text,
+            "category": payload.get("category"),
+            "incoming_msg_id": payload.get("incoming_msg_id"),
+            "context_watermark": payload.get("context_watermark"),
+            "created_by_role": payload.get("created_by_role"),
+            "trace_id": payload.get("trace_id"),
+            "expires_at": expires_at_raw,
+            "status": "pending",
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "version": 1,
+            "approved_at": None,
+            "approved_by": None,
+            "approval_id": None,
+            "edited_message": None,
+            "edit_log": None,
+            "reject_reason": None,
+            "push_sent_count": 0,
+            "consumed_at": None,
+            "send_trace_id": None,
+            "send_status": None,
+        }
+        office_drafts.append(draft)
+        save_office_drafts_atomic(office_drafts)
+
+    push_count = await send_push_to_all(
+        title="Новый драфт",
+        body=text[:80],
+        payload={"kind": "draft_ready", "draft_id": draft_id, "entity_id": str(entity_id)},
+    )
+    async with _office_drafts_lock:
+        target = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+        if target:
+            target["push_sent_count"] = push_count
+            save_office_drafts_atomic(office_drafts)
+
+    log.info("office_draft created: draft_id=%s push_sent=%s", draft_id, push_count)
+    return {"status": "created", "draft_id": draft_id, "push_sent_count": push_count}
+
+
+@app.get("/api/office/drafts/pending")
+async def office_drafts_pending(
+    authorization: Optional[str] = Header(default=None),
+):
+    """iOS reads drafts waiting for approval (non-expired pending)."""
+    check_token(authorization)
+    now = datetime.now(timezone.utc)
+    result = []
+    for d in office_drafts:
+        if d.get("status") != "pending":
+            continue
+        try:
+            exp = datetime.fromisoformat(d["expires_at"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if exp <= now:
+            continue
+        result.append(d)
+    result.sort(key=lambda x: x.get("created_at") or "")
+    return {"drafts": result}
+
+
+@app.post("/api/office/drafts/{draft_id}/approve")
+async def office_drafts_approve(
+    draft_id: str,
+    payload: dict = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Vladimir approves (optionally edits) a pending draft."""
+    check_token(authorization)
+    approval_id = payload.get("approval_id")
+    edited_message = payload.get("edited_message")
+    now = datetime.now(timezone.utc)
+
+    async with _office_drafts_lock:
+        draft = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+        if not draft:
+            raise HTTPException(status_code=404, detail="draft not found")
+
+        if draft.get("status") == "approved" or draft.get("status") == "approved_sending":
+            if approval_id and draft.get("approval_id") == approval_id:
+                return {"status": "ok", "idempotent": True}
+            raise HTTPException(status_code=409, detail="draft already approved")
+        if draft.get("status") in ("rejected", "consumed", "sent"):
+            raise HTTPException(status_code=409, detail=f"draft in terminal status: {draft['status']}")
+
+        try:
+            exp = datetime.fromisoformat(draft["expires_at"].replace("Z", "+00:00"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="draft has invalid expires_at")
+        if exp <= now:
+            raise HTTPException(status_code=410, detail="draft expired")
+
+        draft["status"] = "approved"
+        draft["approved_at"] = now.isoformat()
+        draft["approved_by"] = "vladimir/ios"
+        if approval_id:
+            draft["approval_id"] = approval_id
+        if edited_message and edited_message != draft.get("text"):
+            draft["edited_message"] = edited_message
+            draft["edit_log"] = {
+                "original": draft.get("text"),
+                "edited": edited_message,
+                "edited_at": now.isoformat(),
+            }
+        draft["updated_at"] = now.isoformat()
+        save_office_drafts_atomic(office_drafts)
+
+    log.info("office_draft approved: draft_id=%s approval_id=%s edited=%s",
+             draft_id, approval_id, bool(edited_message))
+    return {"status": "ok", "draft_id": draft_id}
+
+
+@app.post("/api/office/drafts/{draft_id}/reject")
+async def office_drafts_reject(
+    draft_id: str,
+    payload: dict = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Vladimir rejects a pending draft."""
+    check_token(authorization)
+    reject_reason = payload.get("reject_reason")
+    now = datetime.now(timezone.utc)
+
+    async with _office_drafts_lock:
+        draft = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+        if not draft:
+            raise HTTPException(status_code=404, detail="draft not found")
+
+        if draft.get("status") == "rejected":
+            return {"status": "ok", "idempotent": True}
+        if draft.get("status") in _DRAFT_TERMINAL_STATUSES:
+            raise HTTPException(status_code=409, detail=f"draft in terminal status: {draft['status']}")
+
+        draft["status"] = "rejected"
+        draft["reject_reason"] = reject_reason
+        draft["updated_at"] = now.isoformat()
+        save_office_drafts_atomic(office_drafts)
+
+    log.info("office_draft rejected: draft_id=%s reason=%s", draft_id, (reject_reason or "")[:80])
+    return {"status": "ok", "draft_id": draft_id}
+
+
+@app.get("/api/internal/office/drafts/approved")
+async def office_drafts_approved_internal(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Office send_worker reads approved (not yet consumed) drafts for final gate + send."""
+    check_office_write(authorization)
+    result = [d for d in office_drafts if d.get("status") == "approved"]
+    return {"drafts": result}
 
 
 if __name__ == "__main__":
