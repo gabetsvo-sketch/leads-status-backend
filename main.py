@@ -2090,10 +2090,39 @@ async def get_anthropic_health(authorization: Optional[str] = Header(default=Non
 # GET   /api/office/drafts/pending                 auth: WIDGET_TOKEN — iOS reads pending
 # POST  /api/office/drafts/{id}/approve            auth: WIDGET_TOKEN — Vladimir approves
 # POST  /api/office/drafts/{id}/reject             auth: WIDGET_TOKEN — Vladimir rejects
+# POST  /api/office/drafts/{id}/select_variant     auth: WIDGET_TOKEN — Vladimir picks a variant
 # GET   /api/internal/office/drafts/approved       auth: OFFICE_TOKEN — send_worker polls approved
 # POST  /api/internal/office/drafts/{id}/claim     auth: OFFICE_TOKEN — send_worker claims draft
 # POST  /api/internal/office/drafts/{id}/consume   auth: OFFICE_TOKEN — send_worker finalises draft
 # ---------------------------------------------------------------------------
+
+# --- Style lint ---
+_EM_DASH = "—"
+
+
+def _em_dash_lint(text: str) -> bool:
+    """Return True if text passes (contains no em-dash)."""
+    return _EM_DASH not in text
+
+
+def _strip_em_dash(text: str) -> str:
+    """Replace em-dash with colon. Logs a warning."""
+    if _EM_DASH in text:
+        log.warning("em_dash_lint: stripped em-dash from text snippet: %s", text[:80])
+    return text.replace(_EM_DASH, ":")
+
+
+def _lint_variants(variants: list) -> list:
+    """Apply em-dash lint to all variants in place. Returns updated list."""
+    for v in variants:
+        for field in ("text", "rationale"):
+            val = v.get(field, "")
+            if not _em_dash_lint(val):
+                v[field] = _strip_em_dash(val)
+                v["em_dash_lint"] = False
+            else:
+                v.setdefault("em_dash_lint", True)
+    return variants
 
 # Statuses that block re-creation of a draft with the same draft_id.
 _DRAFT_TERMINAL_STATUSES = {
@@ -2188,7 +2217,18 @@ async def office_drafts_create(
             "needs_regen": False,
             "regen_count": 0,
             "last_feedback_at": None,
+            "variants": [],
+            "selected_variant_id": None,
+            "selected_variant_text": None,
+            "selected_at": None,
+            "selected_by": None,
+            "selection_reason": None,
+            "variant_history": [],
         }
+        incoming_variants = payload.get("variants", [])
+        if incoming_variants:
+            incoming_variants = _lint_variants(incoming_variants)
+            draft["variants"] = incoming_variants
         office_drafts.append(draft)
         save_office_drafts_atomic(office_drafts)
 
@@ -2356,6 +2396,60 @@ async def office_drafts_feedback(
     return {"status": "ok", "draft_id": draft_id, "needs_regen": True}
 
 
+@app.post("/api/office/drafts/{draft_id}/select_variant")
+async def office_drafts_select_variant(
+    draft_id: str,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    if authorization != f"Bearer {WIDGET_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    variant_id = payload.get("variant_id")
+    reason = payload.get("reason")
+    if not variant_id:
+        raise HTTPException(status_code=400, detail="variant_id required")
+
+    async with _office_drafts_lock:
+        draft = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+        if not draft:
+            raise HTTPException(status_code=404, detail="Draft not found")
+
+        if draft.get("status") not in ("pending", "regen"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot select variant for draft with status={draft.get('status')}",
+            )
+
+        variants = draft.get("variants", [])
+        selected = next((v for v in variants if v.get("id") == variant_id), None)
+        if not selected:
+            raise HTTPException(status_code=400, detail=f"variant_id={variant_id} not found")
+
+        now = datetime.now(timezone.utc).isoformat()
+        history_entry = {
+            "iteration": len(draft.get("variant_history", [])) + 1,
+            "selected_variant_id": variant_id,
+            "selected_text": selected["text"],
+            "reason": reason,
+            "selected_at": now,
+            "selected_by": "vladimir/ios",
+            "all_variant_texts": {v["id"]: v["text"] for v in variants},
+        }
+        draft["selected_variant_id"] = variant_id
+        draft["selected_variant_text"] = selected["text"]
+        draft["selected_at"] = now
+        draft["selected_by"] = "vladimir/ios"
+        draft["selection_reason"] = reason
+        draft["text"] = selected["text"]  # promote to main text for approve flow
+        draft["updated_at"] = now
+        draft.setdefault("variant_history", []).append(history_entry)
+        save_office_drafts_atomic(office_drafts)
+
+    log.info("draft %s: variant %s selected", draft_id, variant_id)
+    return {"ok": True, "selected_variant_id": variant_id, "text": selected["text"]}
+
+
 @app.get("/api/internal/office/drafts/needs_regen")
 async def office_drafts_needs_regen(
     authorization: Optional[str] = Header(default=None),
@@ -2390,6 +2484,19 @@ async def office_drafts_patch(
         draft["updated_at"] = now.isoformat()
         if payload.get("status"):
             draft["status"] = payload["status"]
+        # Store source-grounding audit fields when provided by regen worker
+        _AUDIT_KEYS = (
+            "source_retrieval_attempted", "requested_source_topic",
+            "selected_source_id", "selected_source_title", "selected_source_status",
+            "source_status", "source_relevance_pass", "source_ignored",
+            "requires_supplier_approval", "no_approved_source_found",
+            "no_relevant_source_found", "source_validation_failed",
+        )
+        for k in _AUDIT_KEYS:
+            if k in payload:
+                draft[k] = payload[k]
+        if "variants" in payload:
+            draft["variants"] = _lint_variants(payload["variants"])
         save_office_drafts_atomic(office_drafts)
 
     log.info("office_draft patched: draft_id=%s version=%s regen_count=%s",
