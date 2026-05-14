@@ -185,6 +185,40 @@ def test_tasks_today_enriches_ui_context_from_leads_inbox(app_client, widget_hea
     assert task["suggested_message"].startswith("Наталья")
 
 
+def test_tasks_today_falls_back_to_phone_timezone_without_leads_inbox(app_client, widget_headers, internal_headers):
+    """Regression: stale tasks without leads_inbox still show safe regional time by phone."""
+    client, _ = app_client
+    r = client.post(
+        "/api/internal/tasks",
+        headers=internal_headers,
+        json={"tasks": [{
+            "task_id": 992,
+            "lead_id": 999778,
+            "due": "2099-01-01T10:00:00+07:00",
+            "created_by": 0,
+            "created_by_name": "system",
+            "task_text": "Связаться",
+            "lead_name": "Клиент",
+            "phone": "+79990001123",
+            "messengers": [],
+            "last_incoming_channel": "",
+            "last_message_channel": "",
+            "whatsapp_phone": "",
+            "telegram_username": "",
+            "amocrm_url": "https://example.invalid/leads/detail/999778",
+            "context_summary": "",
+            "suggested_message": "",
+        }]},
+    )
+    assert r.status_code == 200
+
+    r = client.get("/api/tasks/today", headers=widget_headers)
+    assert r.status_code == 200
+    task = r.json()["tasks"][0]
+    assert task["client_tz_offset_min"] == 180
+    assert task["client_tz_label"] == "Россия / Москва"
+
+
 # ---------------------------------------------------------------------------
 # Packet C — office draft inbox
 # ---------------------------------------------------------------------------

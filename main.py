@@ -246,6 +246,73 @@ def normalize_client_timezone_payload(payload: dict) -> dict:
     return normalized
 
 
+def _resolve_tz_from_phone(phone: str | None) -> dict | None:
+    """Best-effort timezone fallback by phone country code for display only.
+
+    The scheduler normally sends precise `client_tz_*` fields from CRM/city/phone
+    evidence. Older snapshots and stale tasks can miss them; iOS should still show
+    a safe regional time when a usable phone exists. This does not write CRM and
+    does not claim city-level precision unless the country/city evidence exists.
+    """
+    if not phone:
+        return None
+    digits = "".join(ch for ch in str(phone) if ch.isdigit())
+    if not digits:
+        return None
+    if digits.startswith("8") and len(digits) == 11:
+        digits = "7" + digits[1:]
+    country_tz = {
+        "971": (240, "ОАЭ"),
+        "972": (120, "Израиль"),
+        "375": (180, "Беларусь"),
+        "380": (120, "Украина"),
+        "371": (120, "Латвия"),
+        "372": (120, "Эстония"),
+        "370": (120, "Литва"),
+        "374": (240, "Армения"),
+        "994": (240, "Азербайджан"),
+        "995": (240, "Грузия"),
+        "996": (360, "Кыргызстан"),
+        "998": (300, "Узбекистан"),
+        "992": (300, "Таджикистан"),
+        "993": (300, "Туркменистан"),
+        "420": (60, "Чехия"),
+        "358": (120, "Финляндия"),
+        "66": (420, "Таиланд"),
+        "44": (0, "Великобритания"),
+        "49": (60, "Германия"),
+        "33": (60, "Франция"),
+        "39": (60, "Италия"),
+        "34": (60, "Испания"),
+        "31": (60, "Нидерланды"),
+        "84": (420, "Вьетнам"),
+        "60": (480, "Малайзия"),
+        "65": (480, "Сингапур"),
+        "62": (420, "Индонезия / Джакарта"),
+        "61": (600, "Австралия / Сидней"),
+        "86": (480, "Китай"),
+        "82": (540, "Корея"),
+        "81": (540, "Япония"),
+        "91": (330, "Индия"),
+        "55": (-180, "Бразилия"),
+        "52": (-360, "Мексика"),
+        "48": (60, "Польша"),
+        "43": (60, "Австрия"),
+        "41": (60, "Швейцария"),
+        "46": (60, "Швеция"),
+        "47": (60, "Норвегия"),
+        "30": (120, "Греция"),
+        "90": (180, "Турция"),
+        "7": (180, "Россия / Москва"),
+        "1": (-300, "США / NY"),
+    }
+    for width in (3, 2, 1):
+        code = digits[:width]
+        if code in country_tz:
+            offset, label = country_tz[code]
+            return {"client_tz_offset_min": offset, "client_tz_label": label}
+    return None
+
 
 def load_news() -> list:
     if NEWS_FILE.exists():
@@ -1292,13 +1359,21 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
         return ""
 
     def _enrich(t: dict) -> dict:
-        lid = t.get("lead_id")
+        enriched = dict(t)
+        lid = enriched.get("lead_id")
         if not lid:
-            return t
+            if enriched.get("client_tz_offset_min") is None and not enriched.get("client_tz_label"):
+                tz = _resolve_tz_from_phone(enriched.get("phone") or enriched.get("whatsapp_phone"))
+                if tz:
+                    enriched.update(tz)
+            return enriched
         L = leads_by_id.get(lid)
         if not L:
-            return t
-        enriched = dict(t)
+            if enriched.get("client_tz_offset_min") is None and not enriched.get("client_tz_label"):
+                tz = _resolve_tz_from_phone(enriched.get("phone") or enriched.get("whatsapp_phone"))
+                if tz:
+                    enriched.update(tz)
+            return enriched
         for key in ("request_text", "client_city", "client_tz_offset_min", "client_tz_label", "telegram_username"):
             if (enriched.get(key) is None or enriched.get(key) == "") and L.get(key) not in (None, ""):
                 enriched[key] = L.get(key)
@@ -1306,6 +1381,10 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
             enriched["phone"] = L.get("phone")
         if (not enriched.get("whatsapp_phone")) and (L.get("whatsapp_phone") or L.get("phone")):
             enriched["whatsapp_phone"] = L.get("whatsapp_phone") or L.get("phone")
+        if enriched.get("client_tz_offset_min") is None and not enriched.get("client_tz_label"):
+            tz = _resolve_tz_from_phone(enriched.get("phone") or enriched.get("whatsapp_phone") or L.get("phone"))
+            if tz:
+                enriched.update(tz)
         channel = _infer_channel_from_lead(L)
         if channel:
             if not enriched.get("last_message_channel"):

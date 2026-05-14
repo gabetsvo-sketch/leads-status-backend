@@ -42,6 +42,7 @@ def _set_test_env(tmp_path: Path) -> None:
     os.environ["REFRESH_REQUEST_FILE"] = str(tmp_path / "refresh_request.json")
     os.environ["FEEDBACK_FILE"] = str(tmp_path / "feedback.jsonl")
     os.environ["OFFICE_DRAFTS_FILE"] = str(tmp_path / "office_drafts.json")
+    os.environ["DRAFT_FEEDBACK_LOG"] = str(tmp_path / "draft_feedback_log.jsonl")
 
 
 @pytest.fixture
