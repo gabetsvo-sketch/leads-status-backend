@@ -170,6 +170,82 @@ def _prune_completed_today(payload: dict) -> None:
 def save_tasks(payload: dict) -> None:
     TASKS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
+def _normalize_tz_text(value) -> str:
+    return (str(value or "")
+            .strip()
+            .lower()
+            .replace("ё", "е")
+            .replace("-", " ")
+            .replace("–", " ")
+            .replace("—", " "))
+
+
+def _payload_mentions_sakhalin(payload: dict) -> bool:
+    """Return True when CRM/source fields explicitly say Sakhalin.
+
+    This is a transport-side safety net for stale scheduler payloads: if source
+    evidence already reaches LeadsStatus as city/region/custom_fields, the app
+    must not keep showing Russia/Moscow (+3) for a Sakhalin client (+11).
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    candidates = []
+    for key in (
+        "client_city",
+        "city",
+        "region",
+        "client_region",
+        "client_timezone",
+        "timezone",
+        "tz_label",
+        "client_tz_label",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str):
+            candidates.append(value)
+
+    custom_fields = payload.get("custom_fields") or []
+    if isinstance(custom_fields, list):
+        for field in custom_fields:
+            if isinstance(field, dict):
+                for key in ("value", "values", "text", "name", "field_name", "field_code"):
+                    value = field.get(key)
+                    if isinstance(value, str):
+                        candidates.append(value)
+                    elif isinstance(value, list):
+                        candidates.extend(str(item) for item in value if item not in (None, ""))
+            elif isinstance(field, str):
+                candidates.append(field)
+
+    normalized = " | ".join(_normalize_tz_text(item) for item in candidates)
+    return any(marker in normalized for marker in (
+        "сахалин",
+        "южно сахалинск",
+        "сахалинская область",
+        "sakhalin",
+        "yuzhno sakhalinsk",
+    ))
+
+
+def normalize_client_timezone_payload(payload: dict) -> dict:
+    """Normalize client timezone fields when CRM/source evidence says Sakhalin.
+
+    Keeps iOS/backend semantics unchanged: iOS still displays payload fields, but
+    LeadsStatus refuses to transport an explicit Sakhalin city/region as Moscow.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if not _payload_mentions_sakhalin(payload):
+        return payload
+
+    normalized = dict(payload)
+    normalized["client_tz_offset_min"] = 660
+    normalized["client_tz_label"] = "Сахалин / UTC+11"
+    normalized.setdefault("client_tz_name", "Asia/Sakhalin")
+    return normalized
+
+
 
 def load_news() -> list:
     if NEWS_FILE.exists():
@@ -641,6 +717,7 @@ async def internal_lead(
     """Принять новый лид от Mac assistant. Auth: Bearer INTERNAL_TOKEN."""
     check_internal(authorization)
 
+    payload = normalize_client_timezone_payload(payload)
     lead_id = payload.get("lead_id")
     if not lead_id:
         raise HTTPException(status_code=400, detail="lead_id required")
@@ -1159,7 +1236,8 @@ async def internal_tasks(
     }
 
     merged = []
-    for t in tasks:
+    for raw_t in tasks:
+        t = normalize_client_timezone_payload(raw_t)
         tid = t.get("task_id")
         prior = prior_by_id.get(tid) or {}
         # Если scheduler сам перегенерил suggested_message (regen worker), то
@@ -1191,14 +1269,57 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
     # карточке задачи. Сейчас scheduler не пушит request_text в task payload,
     # но он есть в leads_inbox (от _check_new_leads). Делаем enrichment здесь.
     leads_by_id = {L["lead_id"]: L for L in leads_inbox if L.get("lead_id")}
+
+    def _infer_channel_from_lead(L: dict) -> str:
+        """Best-effort read-only display fallback for task cards.
+
+        Older scheduler snapshots can miss messenger fields while the same lead still
+        has request_text / preferred_channel in leads_inbox. This must never send
+        anything; it only restores iOS labels/buttons from stored evidence.
+        """
+        pref = (L.get("preferred_channel") or "").strip().lower()
+        if pref in ("telegram", "whatsapp"):
+            return pref
+        blob = " ".join(str(L.get(k) or "") for k in ("request_text", "source", "utm_source")).lower()
+        if "telegram" in blob or "телеграм" in blob:
+            return "telegram"
+        if "whatsapp" in blob or "ватсап" in blob or "вацап" in blob:
+            return "whatsapp"
+        if L.get("telegram_username"):
+            return "telegram"
+        if L.get("phone"):
+            return "whatsapp"
+        return ""
+
     def _enrich(t: dict) -> dict:
         lid = t.get("lead_id")
-        if not lid or t.get("request_text"):
+        if not lid:
             return t
         L = leads_by_id.get(lid)
-        if L and L.get("request_text"):
-            t = {**t, "request_text": L["request_text"]}
-        return t
+        if not L:
+            return t
+        enriched = dict(t)
+        for key in ("request_text", "client_city", "client_tz_offset_min", "client_tz_label", "telegram_username"):
+            if (enriched.get(key) is None or enriched.get(key) == "") and L.get(key) not in (None, ""):
+                enriched[key] = L.get(key)
+        if (not enriched.get("phone")) and L.get("phone"):
+            enriched["phone"] = L.get("phone")
+        if (not enriched.get("whatsapp_phone")) and (L.get("whatsapp_phone") or L.get("phone")):
+            enriched["whatsapp_phone"] = L.get("whatsapp_phone") or L.get("phone")
+        channel = _infer_channel_from_lead(L)
+        if channel:
+            if not enriched.get("last_message_channel"):
+                enriched["last_message_channel"] = channel
+            if not enriched.get("last_incoming_channel"):
+                enriched["last_incoming_channel"] = channel
+            messengers = enriched.get("messengers") or []
+            if channel not in messengers:
+                enriched["messengers"] = [*messengers, channel]
+        # New-lead text is not a perfect task-specific draft, but it is safer than
+        # an empty card and still requires Vladimir's manual review/send.
+        if not (enriched.get("suggested_message") or "").strip() and (L.get("timer_3min_text") or "").strip():
+            enriched["suggested_message"] = L.get("timer_3min_text")
+        return enriched
     enriched_tasks = [_enrich(t) for t in (tasks_today.get("tasks") or [])]
     enriched_completed = [_enrich(t) for t in (tasks_today.get("completed_today") or [])]
 
@@ -2124,6 +2245,79 @@ def _lint_variants(variants: list) -> list:
                 v.setdefault("em_dash_lint", True)
     return variants
 
+
+_SEND_FORBIDDEN_VARIANT_KEYS = {
+    "send", "send_now", "channel_send", "real_send", "needs_send", "pending_send",
+    "crm_update", "status_change", "task_close", "lead_status",
+    "approved_at", "send_trace_id", "claimed_at", "claimed_by", "claim_expires_at",
+    "send_status", "consumed_at", "consumed_by_scheduler_at",
+}
+
+
+def _variants_json_equal(left, right) -> bool:
+    return json.dumps(left, ensure_ascii=False, sort_keys=True) == json.dumps(right, ensure_ascii=False, sort_keys=True)
+
+
+def _normalize_structured_variants(payload: dict) -> list:
+    """Validate and normalize canonical structured_variants with legacy variants alias."""
+    has_structured = "structured_variants" in payload
+    has_legacy = "variants" in payload
+    structured = payload.get("structured_variants") if has_structured else None
+    legacy = payload.get("variants") if has_legacy else None
+
+    if has_structured and has_legacy and not _variants_json_equal(structured, legacy):
+        raise HTTPException(status_code=400, detail="structured_variants and variants differ")
+
+    raw_variants = structured if has_structured else legacy
+    if raw_variants in (None, []):
+        return []
+    if not isinstance(raw_variants, list):
+        raise HTTPException(status_code=400, detail="structured_variants must be a list")
+
+    normalized = []
+    seen_ids = set()
+    for idx, item in enumerate(raw_variants):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"variant[{idx}] must be an object")
+        forbidden = sorted(set(item) & _SEND_FORBIDDEN_VARIANT_KEYS)
+        if forbidden:
+            raise HTTPException(status_code=400, detail=f"variant contains forbidden keys: {', '.join(forbidden)}")
+        variant_id = item.get("id")
+        text = item.get("text")
+        if not isinstance(variant_id, str) or not variant_id.strip():
+            raise HTTPException(status_code=400, detail=f"variant[{idx}].id required")
+        if variant_id in seen_ids:
+            raise HTTPException(status_code=400, detail=f"duplicate variant id: {variant_id}")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(status_code=400, detail=f"variant[{idx}].text required")
+        seen_ids.add(variant_id)
+        normalized.append(dict(item))
+
+    return _lint_variants(normalized)
+
+
+def _sync_structured_variants_alias(draft: dict) -> None:
+    """Ensure a touched draft exposes canonical structured_variants and legacy variants."""
+    structured = draft.get("structured_variants")
+    legacy = draft.get("variants")
+    if structured is None and legacy is None:
+        structured = []
+    elif structured is None:
+        structured = legacy or []
+    elif legacy is None:
+        legacy = structured or []
+    if legacy is None:
+        legacy = structured or []
+    draft["structured_variants"] = structured
+    draft["variants"] = legacy
+    draft.setdefault("structured_variant_decisions", [])
+
+
+def _draft_public_response(draft: dict) -> dict:
+    response = dict(draft)
+    _sync_structured_variants_alias(response)
+    return response
+
 # Statuses that block re-creation of a draft with the same draft_id.
 _DRAFT_TERMINAL_STATUSES = {
     "approved", "approved_sending",
@@ -2160,6 +2354,8 @@ async def office_drafts_create(
         raise HTTPException(status_code=400, detail="expires_at must be ISO8601")
 
     now_iso = datetime.now(timezone.utc).isoformat()
+    has_variant_payload = "structured_variants" in payload or "variants" in payload
+    incoming_structured_variants = _normalize_structured_variants(payload) if has_variant_payload else []
 
     async with _office_drafts_lock:
         existing = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
@@ -2169,11 +2365,29 @@ async def office_drafts_create(
                     status_code=409,
                     detail=f"draft already in terminal status: {existing['status']}",
                 )
+            if has_variant_payload and existing.get("selected_variant_id"):
+                existing_variants = existing.get("structured_variants") or existing.get("variants") or []
+                current_selected = next(
+                    (v for v in existing_variants if v.get("id") == existing.get("selected_variant_id")),
+                    None,
+                )
+                refreshed_selected = next(
+                    (v for v in incoming_structured_variants if v.get("id") == existing.get("selected_variant_id")),
+                    None,
+                )
+                if current_selected != refreshed_selected:
+                    raise HTTPException(status_code=409, detail="selected variant cannot be removed or changed")
             existing["text"] = text
             existing["entity_id"] = entity_id
             existing["expires_at"] = expires_at_raw
             existing["updated_at"] = now_iso
             existing["version"] = existing.get("version", 1) + 1
+            if has_variant_payload:
+                existing["structured_variants"] = incoming_structured_variants
+                existing["variants"] = incoming_structured_variants
+                existing.setdefault("structured_variant_decisions", [])
+            else:
+                _sync_structured_variants_alias(existing)
             for field in ("category", "incoming_msg_id", "context_watermark", "created_by_role", "trace_id"):
                 if field in payload:
                     existing[field] = payload[field]
@@ -2217,18 +2431,16 @@ async def office_drafts_create(
             "needs_regen": False,
             "regen_count": 0,
             "last_feedback_at": None,
-            "variants": [],
+            "structured_variants": incoming_structured_variants,
+            "variants": incoming_structured_variants,
             "selected_variant_id": None,
             "selected_variant_text": None,
             "selected_at": None,
             "selected_by": None,
             "selection_reason": None,
             "variant_history": [],
+            "structured_variant_decisions": [],
         }
-        incoming_variants = payload.get("variants", [])
-        if incoming_variants:
-            incoming_variants = _lint_variants(incoming_variants)
-            draft["variants"] = incoming_variants
         office_drafts.append(draft)
         save_office_drafts_atomic(office_drafts)
 
@@ -2264,7 +2476,7 @@ async def office_drafts_pending(
             continue
         if exp <= now:
             continue
-        result.append(d)
+        result.append(_draft_public_response(d))
     result.sort(key=lambda x: x.get("created_at") or "")
     return {"drafts": result}
 
@@ -2402,11 +2614,11 @@ async def office_drafts_select_variant(
     payload: dict = Body(...),
     authorization: Optional[str] = Header(default=None),
 ):
-    if authorization != f"Bearer {WIDGET_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    check_token(authorization)
 
     variant_id = payload.get("variant_id")
     reason = payload.get("reason")
+    decision_id = payload.get("decision_id") or payload.get("idempotency_key")
     if not variant_id:
         raise HTTPException(status_code=400, detail="variant_id required")
 
@@ -2415,18 +2627,52 @@ async def office_drafts_select_variant(
         if not draft:
             raise HTTPException(status_code=404, detail="Draft not found")
 
-        if draft.get("status") not in ("pending", "regen"):
+        _sync_structured_variants_alias(draft)
+        if draft.get("status") != "pending":
             raise HTTPException(
-                status_code=400,
+                status_code=409,
                 detail=f"Cannot select variant for draft with status={draft.get('status')}",
             )
 
-        variants = draft.get("variants", [])
+        variants = draft.get("structured_variants") or draft.get("variants") or []
         selected = next((v for v in variants if v.get("id") == variant_id), None)
         if not selected:
             raise HTTPException(status_code=400, detail=f"variant_id={variant_id} not found")
 
+        decisions = draft.setdefault("structured_variant_decisions", [])
+        if decision_id:
+            prior_decision = next((d for d in decisions if d.get("decision_id") == decision_id), None)
+            if prior_decision:
+                if prior_decision.get("selected_variant_id") == variant_id and prior_decision.get("reason") == reason:
+                    return {
+                        "status": "ok",
+                        "ok": True,
+                        "idempotent": True,
+                        "draft_id": draft_id,
+                        "selected_variant_id": variant_id,
+                        "text": draft.get("text"),
+                        "draft_status": draft.get("status"),
+                        "send_performed": False,
+                        "backend_sent_message": False,
+                        "crm_mutated": False,
+                        "queue_cache_mutated": False,
+                        "approval_changed": False,
+                    }
+                raise HTTPException(status_code=409, detail="selection decision id conflict")
+
         now = datetime.now(timezone.utc).isoformat()
+        status_before = draft.get("status")
+        decision_entry = {
+            "decision_id": decision_id,
+            "selected_variant_id": variant_id,
+            "selected_text": selected["text"],
+            "reason": reason,
+            "selected_at": now,
+            "selected_by": "vladimir/ios",
+            "draft_version_at_selection": draft.get("version", 1),
+            "status_before": status_before,
+            "no_send_side_effect": True,
+        }
         history_entry = {
             "iteration": len(draft.get("variant_history", [])) + 1,
             "selected_variant_id": variant_id,
@@ -2434,6 +2680,7 @@ async def office_drafts_select_variant(
             "reason": reason,
             "selected_at": now,
             "selected_by": "vladimir/ios",
+            "decision_id": decision_id,
             "all_variant_texts": {v["id"]: v["text"] for v in variants},
         }
         draft["selected_variant_id"] = variant_id
@@ -2442,12 +2689,26 @@ async def office_drafts_select_variant(
         draft["selected_by"] = "vladimir/ios"
         draft["selection_reason"] = reason
         draft["text"] = selected["text"]  # promote to main text for approve flow
+        draft["version"] = draft.get("version", 1) + 1
         draft["updated_at"] = now
+        decisions.append(decision_entry)
         draft.setdefault("variant_history", []).append(history_entry)
         save_office_drafts_atomic(office_drafts)
 
     log.info("draft %s: variant %s selected", draft_id, variant_id)
-    return {"ok": True, "selected_variant_id": variant_id, "text": selected["text"]}
+    return {
+        "status": "ok",
+        "ok": True,
+        "draft_id": draft_id,
+        "selected_variant_id": variant_id,
+        "text": selected["text"],
+        "draft_status": "pending",
+        "send_performed": False,
+        "backend_sent_message": False,
+        "crm_mutated": False,
+        "queue_cache_mutated": False,
+        "approval_changed": False,
+    }
 
 
 @app.get("/api/internal/office/drafts/needs_regen")
@@ -2474,6 +2735,8 @@ async def office_drafts_patch(
         draft = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
         if not draft:
             raise HTTPException(status_code=404, detail="draft not found")
+        if payload.get("status") and payload["status"] not in ("pending", "rejected"):
+            raise HTTPException(status_code=400, detail="patch status may only be pending or rejected")
 
         new_text = payload.get("text")
         if new_text:
@@ -2495,8 +2758,13 @@ async def office_drafts_patch(
         for k in _AUDIT_KEYS:
             if k in payload:
                 draft[k] = payload[k]
-        if "variants" in payload:
-            draft["variants"] = _lint_variants(payload["variants"])
+        if "structured_variants" in payload or "variants" in payload:
+            incoming_structured_variants = _normalize_structured_variants(payload)
+            draft["structured_variants"] = incoming_structured_variants
+            draft["variants"] = incoming_structured_variants
+            draft.setdefault("structured_variant_decisions", [])
+        else:
+            _sync_structured_variants_alias(draft)
         save_office_drafts_atomic(office_drafts)
 
     log.info("office_draft patched: draft_id=%s version=%s regen_count=%s",
@@ -2514,7 +2782,7 @@ async def office_draft_get(
     draft = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
     if not draft:
         raise HTTPException(status_code=404, detail="draft not found")
-    return draft
+    return _draft_public_response(draft)
 
 
 @app.get("/api/internal/office/drafts/approved")

@@ -129,6 +129,62 @@ def test_devices_register_persists_token(app_client, widget_headers):
     assert r2.status_code == 200, "повторный register должен быть idempotent"
 
 
+def test_tasks_today_enriches_ui_context_from_leads_inbox(app_client, widget_headers, internal_headers):
+    """Regression: old scheduler snapshots may miss tz/channel/draft fields.
+
+    GET /api/tasks/today should restore display-only context from leads_inbox when
+    available, without CRM writes or sending anything.
+    """
+    client, _ = app_client
+    lead_id = 999777
+    client.post(
+        "/api/internal/lead",
+        headers=internal_headers,
+        json={
+            "lead_id": lead_id,
+            "name": "Наталья",
+            "phone": "+79990001122",
+            "client_tz_offset_min": 180,
+            "client_tz_label": "Санкт-Петербург",
+            "request_text": "В каком мессенджере с вами удобнее связаться?: WhatsApp",
+            "start_message": "Наталья, здравствуйте. Получил вашу заявку, скоро свяжусь.",
+        },
+    )
+    r = client.post(
+        "/api/internal/tasks",
+        headers=internal_headers,
+        json={"tasks": [{
+            "task_id": 991,
+            "lead_id": lead_id,
+            "due": "2099-01-01T10:00:00+07:00",
+            "created_by": 0,
+            "created_by_name": "system",
+            "task_text": "Связаться",
+            "lead_name": "Наталья",
+            "phone": "",
+            "messengers": [],
+            "last_incoming_channel": "",
+            "last_message_channel": "",
+            "whatsapp_phone": "",
+            "telegram_username": "",
+            "amocrm_url": "https://example.invalid/leads/detail/999777",
+            "context_summary": "",
+            "suggested_message": "",
+        }]},
+    )
+    assert r.status_code == 200
+
+    r = client.get("/api/tasks/today", headers=widget_headers)
+    assert r.status_code == 200
+    task = r.json()["tasks"][0]
+    assert task["client_tz_offset_min"] == 180
+    assert task["client_tz_label"] == "Санкт-Петербург"
+    assert task["last_message_channel"] == "whatsapp"
+    assert "whatsapp" in task["messengers"]
+    assert task["whatsapp_phone"]
+    assert task["suggested_message"].startswith("Наталья")
+
+
 # ---------------------------------------------------------------------------
 # Packet C — office draft inbox
 # ---------------------------------------------------------------------------
@@ -277,3 +333,382 @@ def test_approved_internal_list_excludes_pending_and_rejected(app_client, office
     assert "d-a2" in ids
     assert "d-a1" not in ids
     assert "d-a3" not in ids
+
+
+def _variant(variant_id="v1", text="Вариант текста", **extra):
+    return {
+        "id": variant_id,
+        "text": text,
+        "rationale": "Показываем только Владимиру",
+        "label": "Мягко",
+        "em_dash_lint": True,
+        **extra,
+    }
+
+
+def _get_draft(client, draft_id, widget_headers):
+    r = client.get(f"/api/office/drafts/{draft_id}", headers=widget_headers)
+    assert r.status_code == 200, f"get draft failed: {r.status_code} {r.text}"
+    return r.json()
+
+
+def test_office_create_accepts_structured_variants_and_readback_aliases(app_client, office_headers, widget_headers):
+    client, _ = app_client
+    variants = [_variant("soft", "Мягкий вариант"), _variant("direct", "Прямой вариант")]
+
+    r = client.post(
+        "/api/office/drafts",
+        headers=office_headers,
+        json=_draft("d-structured", structured_variants=variants),
+    )
+
+    assert r.status_code == 200, f"create failed: {r.status_code} {r.text}"
+    draft = _get_draft(client, "d-structured", widget_headers)
+    assert draft["status"] == "pending"
+    assert draft["structured_variants"] == variants
+    assert draft["variants"] == variants
+
+    r_pending = client.get("/api/office/drafts/pending", headers=widget_headers)
+    pending = {d["draft_id"]: d for d in r_pending.json().get("drafts", [])}
+    assert pending["d-structured"]["structured_variants"] == variants
+    assert pending["d-structured"]["variants"] == variants
+
+
+def test_office_create_accepts_legacy_variants_and_backfills_structured_alias(app_client, office_headers, widget_headers):
+    client, _ = app_client
+    variants = [_variant("legacy", "Старый вариант")]
+
+    r = client.post("/api/office/drafts", headers=office_headers, json=_draft("d-legacy", variants=variants))
+
+    assert r.status_code == 200, f"legacy create failed: {r.status_code} {r.text}"
+    draft = _get_draft(client, "d-legacy", widget_headers)
+    assert draft["structured_variants"] == variants
+    assert draft["variants"] == variants
+
+
+def test_office_create_rejects_invalid_structured_variants(app_client, office_headers):
+    client, _ = app_client
+
+    conflicting = client.post(
+        "/api/office/drafts",
+        headers=office_headers,
+        json=_draft(
+            "d-conflict",
+            structured_variants=[_variant("a", "A")],
+            variants=[_variant("b", "B")],
+        ),
+    )
+    assert conflicting.status_code == 400
+
+    duplicate_ids = client.post(
+        "/api/office/drafts",
+        headers=office_headers,
+        json=_draft("d-dupe-variants", structured_variants=[_variant("same", "A"), _variant("same", "B")]),
+    )
+    assert duplicate_ids.status_code == 400
+
+    empty_text = client.post(
+        "/api/office/drafts",
+        headers=office_headers,
+        json=_draft("d-empty-variant", structured_variants=[_variant("empty", "")]),
+    )
+    assert empty_text.status_code == 400
+
+    forbidden = client.post(
+        "/api/office/drafts",
+        headers=office_headers,
+        json=_draft("d-send-key", structured_variants=[_variant("bad", "Text", needs_send=True)]),
+    )
+    assert forbidden.status_code == 400
+
+
+def test_office_patch_accepts_structured_variants_and_preserves_no_send_fields(app_client, office_headers, widget_headers):
+    client, _ = app_client
+    client.post("/api/office/drafts", headers=office_headers, json=_draft("d-patch-variants"))
+    variants = [_variant("regen", "Новый вариант после регена")]
+
+    r = client.patch(
+        "/api/internal/office/drafts/d-patch-variants",
+        headers=office_headers,
+        json={"text": "Обновлённый текст", "structured_variants": variants},
+    )
+
+    assert r.status_code == 200, f"patch failed: {r.status_code} {r.text}"
+    draft = _get_draft(client, "d-patch-variants", widget_headers)
+    assert draft["status"] == "pending"
+    assert draft["structured_variants"] == variants
+    assert draft["variants"] == variants
+    for key in ("send_trace_id", "claimed_at", "claimed_by", "claim_expires_at", "send_status", "consumed_at", "consumed_by_scheduler_at"):
+        assert draft.get(key) is None
+
+
+def test_office_patch_rejects_approval_or_send_status_side_effect(app_client, office_headers):
+    client, _ = app_client
+    client.post("/api/office/drafts", headers=office_headers, json=_draft("d-patch-no-approve"))
+
+    r = client.patch(
+        "/api/internal/office/drafts/d-patch-no-approve",
+        headers=office_headers,
+        json={"status": "approved"},
+    )
+
+    assert r.status_code == 400
+    approved = client.get("/api/internal/office/drafts/approved", headers=office_headers).json().get("drafts", [])
+    assert "d-patch-no-approve" not in {d["draft_id"] for d in approved}
+
+
+def test_office_duplicate_update_refreshes_structured_variants_when_unselected(app_client, office_headers, widget_headers):
+    client, _ = app_client
+    client.post(
+        "/api/office/drafts",
+        headers=office_headers,
+        json=_draft("d-update-variants", structured_variants=[_variant("old", "Старый вариант")]),
+    )
+
+    r = client.post(
+        "/api/office/drafts",
+        headers=office_headers,
+        json=_draft("d-update-variants", text="Обновлённый основной текст", structured_variants=[_variant("new", "Новый вариант")]),
+    )
+
+    assert r.status_code == 200
+    assert r.json().get("status") == "updated"
+    draft = _get_draft(client, "d-update-variants", widget_headers)
+    assert draft["text"] == "Обновлённый основной текст"
+    assert draft["status"] == "pending"
+    assert draft["structured_variants"] == [_variant("new", "Новый вариант")]
+    pending = client.get("/api/office/drafts/pending", headers=widget_headers).json().get("drafts", [])
+    assert [d["draft_id"] for d in pending].count("d-update-variants") == 1
+
+
+def test_select_variant_promotes_text_but_does_not_approve_or_send(app_client, office_headers, widget_headers):
+    client, _ = app_client
+    variants = [_variant("a", "Первый вариант"), _variant("b", "Выбранный вариант")]
+    client.post("/api/office/drafts", headers=office_headers, json=_draft("d-select", structured_variants=variants))
+
+    r = client.post(
+        "/api/office/drafts/d-select/select_variant",
+        headers=widget_headers,
+        json={"variant_id": "b", "reason": "лучше", "decision_id": "dec-select-1"},
+    )
+
+    assert r.status_code == 200, f"select failed: {r.status_code} {r.text}"
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["draft_status"] == "pending"
+    assert body["selected_variant_id"] == "b"
+    assert body["text"] == "Выбранный вариант"
+    assert body["send_performed"] is False
+    assert body["backend_sent_message"] is False
+    assert body["crm_mutated"] is False
+    assert body["queue_cache_mutated"] is False
+    assert body["approval_changed"] is False
+
+    draft = _get_draft(client, "d-select", widget_headers)
+    assert draft["status"] == "pending"
+    assert draft["text"] == "Выбранный вариант"
+    assert draft["selected_variant_id"] == "b"
+    assert len(draft["structured_variant_decisions"]) == 1
+    for key in ("send_trace_id", "claimed_at", "claimed_by", "claim_expires_at", "send_status", "consumed_at", "consumed_by_scheduler_at"):
+        assert draft.get(key) is None
+
+    approved = client.get("/api/internal/office/drafts/approved", headers=office_headers).json().get("drafts", [])
+    assert "d-select" not in {d["draft_id"] for d in approved}
+
+
+def test_select_variant_idempotency_and_conflict(app_client, office_headers, widget_headers):
+    client, _ = app_client
+    client.post(
+        "/api/office/drafts",
+        headers=office_headers,
+        json=_draft("d-select-idem", structured_variants=[_variant("a", "A"), _variant("b", "B")]),
+    )
+    payload = {"variant_id": "a", "reason": "same", "decision_id": "dec-1"}
+
+    first = client.post("/api/office/drafts/d-select-idem/select_variant", headers=widget_headers, json=payload)
+    second = client.post("/api/office/drafts/d-select-idem/select_variant", headers=widget_headers, json=payload)
+    conflict = client.post(
+        "/api/office/drafts/d-select-idem/select_variant",
+        headers=widget_headers,
+        json={"variant_id": "b", "reason": "same", "decision_id": "dec-1"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json().get("idempotent") is True
+    assert conflict.status_code == 409
+    draft = _get_draft(client, "d-select-idem", widget_headers)
+    assert len(draft["structured_variant_decisions"]) == 1
+    assert len(draft["variant_history"]) == 1
+
+
+def test_select_variant_rejects_approved_or_unknown_without_extra_mutation(app_client, office_headers, widget_headers):
+    client, _ = app_client
+    client.post("/api/office/drafts", headers=office_headers, json=_draft("d-unknown", structured_variants=[_variant("a", "A")]))
+
+    missing = client.post(
+        "/api/office/drafts/d-unknown/select_variant",
+        headers=widget_headers,
+        json={"variant_id": "missing", "decision_id": "dec-missing"},
+    )
+    assert missing.status_code == 400
+    draft = _get_draft(client, "d-unknown", widget_headers)
+    assert draft["text"] == "Добрый день! Ваша заявка рассмотрена."
+    assert draft["selected_variant_id"] is None
+    assert draft["structured_variant_decisions"] == []
+
+    client.post("/api/office/drafts/d-unknown/approve", headers=widget_headers, json={"approval_id": "appr-after-missing"})
+    approved_select = client.post(
+        "/api/office/drafts/d-unknown/select_variant",
+        headers=widget_headers,
+        json={"variant_id": "a", "decision_id": "dec-after-approve"},
+    )
+    assert approved_select.status_code in (400, 409)
+    approved = client.get("/api/internal/office/drafts/approved", headers=office_headers).json().get("drafts", [])
+    assert "d-unknown" in {d["draft_id"] for d in approved}
+
+
+def test_old_stored_draft_with_only_variants_returns_structured_variants(app_client, widget_headers):
+    client, main = app_client
+    old_variant = _variant("legacy-only", "Только legacy")
+    main.office_drafts.append({
+        **_draft("d-old-storage"),
+        "status": "pending",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "variants": [old_variant],
+    })
+
+    draft = _get_draft(client, "d-old-storage", widget_headers)
+
+    assert draft["structured_variants"] == [old_variant]
+    assert draft["variants"] == [old_variant]
+
+
+def test_structured_variants_keep_approve_claim_consume_dry_run_contract(app_client, office_headers, widget_headers):
+    client, _ = app_client
+    client.post(
+        "/api/office/drafts",
+        headers=office_headers,
+        json=_draft("d-send-contract", structured_variants=[_variant("a", "A")]),
+    )
+    approve = client.post("/api/office/drafts/d-send-contract/approve", headers=widget_headers, json={"approval_id": "appr-contract"})
+    approved = client.get("/api/internal/office/drafts/approved", headers=office_headers)
+    claim = client.post(
+        "/api/internal/office/drafts/d-send-contract/claim",
+        headers=office_headers,
+        json={"claimed_by": "test-scheduler"},
+    )
+    trace = claim.json().get("send_trace_id")
+    consume = client.post(
+        "/api/internal/office/drafts/d-send-contract/consume",
+        headers=office_headers,
+        json={"send_trace_id": trace, "send_status": "dry_run"},
+    )
+
+    assert approve.status_code == 200
+    assert approved.status_code == 200
+    assert "d-send-contract" in {d["draft_id"] for d in approved.json().get("drafts", [])}
+    assert claim.status_code == 200
+    assert trace
+    assert consume.status_code == 200
+    assert consume.json().get("status") == "dry_run_consumed"
+
+# ---------------------------------------------------------------------------
+# LS-TZ-MIKHAIL-1108 — Sakhalin timezone transport regression
+# ---------------------------------------------------------------------------
+
+
+def test_internal_tasks_normalizes_sakhalin_timezone_not_moscow(app_client, internal_headers, widget_headers):
+    """If CRM/source city says Sakhalin, iOS payload must not show Moscow (+3)."""
+    client, _ = app_client
+
+    r = client.post(
+        "/api/internal/tasks",
+        headers=internal_headers,
+        json={
+            "tasks": [
+                {
+                    "task_id": 1108,
+                    "lead_id": 501108,
+                    "lead_name": "Михаил",
+                    "phone": "+7 *** *** 1108",
+                    "client_city": "Сахалин",
+                    # Stale scheduler/phone fallback values that caused the incident.
+                    "client_tz_offset_min": 180,
+                    "client_tz_label": "Россия / Москва",
+                }
+            ]
+        },
+    )
+    assert r.status_code == 200, f"internal tasks failed: {r.status_code} {r.text}"
+
+    today = client.get("/api/tasks/today", headers=widget_headers)
+    assert today.status_code == 200
+    task = today.json()["tasks"][0]
+    assert task["phone"].endswith("1108")
+    assert task["client_city"] == "Сахалин"
+    assert task["client_tz_offset_min"] == 660
+    assert "Сахалин" in task["client_tz_label"]
+    assert "Москва" not in task["client_tz_label"]
+    assert task["client_tz_offset_min"] > 420  # Sakhalin is ahead of Phuket/Bangkok UTC+7.
+
+
+def test_internal_tasks_normalizes_yuzhno_sakhalinsk_alias(app_client, internal_headers, widget_headers):
+    client, _ = app_client
+
+    r = client.post(
+        "/api/internal/tasks",
+        headers=internal_headers,
+        json={
+            "tasks": [
+                {
+                    "task_id": 1109,
+                    "lead_id": 501109,
+                    "lead_name": "Synthetic",
+                    "phone": "+7 *** *** 1108",
+                    "client_city": "Южно-Сахалинск",
+                    "client_tz_offset_min": 180,
+                    "client_tz_label": "Россия / Москва",
+                }
+            ]
+        },
+    )
+    assert r.status_code == 200
+
+    task = client.get("/api/tasks/today", headers=widget_headers).json()["tasks"][0]
+    assert task["client_tz_offset_min"] == 660
+    assert "Сахалин" in task["client_tz_label"]
+    assert "Москва" not in task["client_tz_label"]
+    assert task["client_tz_offset_min"] > 420
+
+
+def test_internal_lead_normalizes_sakhalin_custom_field_timezone(app_client, internal_headers, widget_headers):
+    """Lead inbox transport also uses CRM/custom-field evidence, not phone-country fallback."""
+    client, _ = app_client
+
+    r = client.post(
+        "/api/internal/lead",
+        headers=internal_headers,
+        json={
+            "lead_id": 501108,
+            "name": "Михаил",
+            "phone": "+7 *** *** 1108",
+            "client_city": "",
+            "client_tz_offset_min": 180,
+            "client_tz_label": "Россия / Москва",
+            "custom_fields": [
+                {"field_name": "Регион", "value": "Сахалинская область"},
+            ],
+        },
+    )
+    assert r.status_code == 200, f"lead create failed: {r.status_code} {r.text}"
+
+    leads = client.get("/api/leads", headers=widget_headers)
+    assert leads.status_code == 200
+    lead = next(item for item in leads.json().get("leads", []) if item.get("lead_id") == 501108)
+    assert lead["client_tz_offset_min"] == 660
+    assert "Сахалин" in lead["client_tz_label"]
+    assert "Москва" not in lead["client_tz_label"]
+    assert lead["client_tz_offset_min"] > 420
+
