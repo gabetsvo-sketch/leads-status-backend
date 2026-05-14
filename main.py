@@ -246,7 +246,7 @@ def normalize_client_timezone_payload(payload: dict) -> dict:
     return normalized
 
 
-def _resolve_tz_from_phone(phone: str | None) -> dict | None:
+def _resolve_tz_from_phone(phone: Optional[str]) -> Optional[dict]:
     """Best-effort timezone fallback by phone country code for display only.
 
     The scheduler normally sends precise `client_tz_*` fields from CRM/city/phone
