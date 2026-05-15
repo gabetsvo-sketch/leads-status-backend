@@ -1358,6 +1358,18 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
             return "whatsapp"
         return ""
 
+    def _mark_missing_contact_context(enriched: dict) -> dict:
+        has_contact = any(enriched.get(k) for k in ("phone", "whatsapp_phone", "telegram_username", "telegram", "whatsapp"))
+        has_channel = bool(enriched.get("messengers") or enriched.get("last_message_channel") or enriched.get("last_incoming_channel"))
+        has_tz = enriched.get("client_tz_offset_min") is not None or bool(enriched.get("client_tz_label"))
+        if not (has_contact or has_channel or has_tz):
+            enriched.setdefault("contact_lookup_status", "contact_missing")
+            enriched.setdefault(
+                "contact_action_blocker",
+                "Контакт/мессенджер не подтянут. Открой AmoCRM и обнови sync перед отправкой.",
+            )
+        return enriched
+
     def _enrich(t: dict) -> dict:
         enriched = dict(t)
         lid = enriched.get("lead_id")
@@ -1366,14 +1378,14 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
                 tz = _resolve_tz_from_phone(enriched.get("phone") or enriched.get("whatsapp_phone"))
                 if tz:
                     enriched.update(tz)
-            return enriched
+            return _mark_missing_contact_context(enriched)
         L = leads_by_id.get(lid)
         if not L:
             if enriched.get("client_tz_offset_min") is None and not enriched.get("client_tz_label"):
                 tz = _resolve_tz_from_phone(enriched.get("phone") or enriched.get("whatsapp_phone"))
                 if tz:
                     enriched.update(tz)
-            return enriched
+            return _mark_missing_contact_context(enriched)
         for key in ("request_text", "client_city", "client_tz_offset_min", "client_tz_label", "telegram_username"):
             if (enriched.get(key) is None or enriched.get(key) == "") and L.get(key) not in (None, ""):
                 enriched[key] = L.get(key)
@@ -1394,6 +1406,15 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
             messengers = enriched.get("messengers") or []
             if channel not in messengers:
                 enriched["messengers"] = [*messengers, channel]
+        has_contact = any(enriched.get(k) for k in ("phone", "whatsapp_phone", "telegram_username", "telegram", "whatsapp"))
+        has_channel = bool(enriched.get("messengers") or enriched.get("last_message_channel") or enriched.get("last_incoming_channel"))
+        has_tz = enriched.get("client_tz_offset_min") is not None or bool(enriched.get("client_tz_label"))
+        if not (has_contact or has_channel or has_tz):
+            enriched.setdefault("contact_lookup_status", "contact_missing")
+            enriched.setdefault(
+                "contact_action_blocker",
+                "Контакт/мессенджер не подтянут. Открой AmoCRM и обнови sync перед отправкой.",
+            )
         # Safety gate (2026-05-15): do NOT fill task-specific suggested_message
         # from new-lead timer_3min_text. That timer text is an emergency first-touch
         # fallback and is not grounded in the task's CRM chat history / Message KB.

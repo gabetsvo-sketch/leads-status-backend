@@ -222,6 +222,46 @@ def test_tasks_today_falls_back_to_phone_timezone_without_leads_inbox(app_client
     assert task["client_tz_label"] == "Россия / Москва"
 
 
+def test_tasks_today_marks_missing_contact_context_without_leads_inbox(app_client, widget_headers, internal_headers):
+    """Regression: blank task cards must show an explicit contact blocker.
+
+    If neither scheduler payload nor leads_inbox can provide contact/channel/time,
+    backend must not silently return an empty action area and must not fabricate a
+    task draft from new-lead fallbacks.
+    """
+    client, _ = app_client
+    r = client.post(
+        "/api/internal/tasks",
+        headers=internal_headers,
+        json={"tasks": [{
+            "task_id": 993,
+            "lead_id": 999779,
+            "due": "2099-01-01T10:00:00+07:00",
+            "created_by": 12933886,
+            "created_by_name": "Владимир",
+            "task_text": "Связаться",
+            "lead_name": "Клиент",
+            "phone": "",
+            "messengers": [],
+            "last_incoming_channel": "",
+            "last_message_channel": "",
+            "whatsapp_phone": "",
+            "telegram_username": "",
+            "amocrm_url": "https://example.invalid/leads/detail/999779",
+            "context_summary": "",
+            "suggested_message": "",
+        }]},
+    )
+    assert r.status_code == 200
+
+    r = client.get("/api/tasks/today", headers=widget_headers)
+    assert r.status_code == 200
+    task = r.json()["tasks"][0]
+    assert task["contact_lookup_status"] == "contact_missing"
+    assert "Контакт" in task["contact_action_blocker"]
+    assert task["suggested_message"] == ""
+
+
 # ---------------------------------------------------------------------------
 # Packet C — office draft inbox
 # ---------------------------------------------------------------------------
