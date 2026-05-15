@@ -1394,10 +1394,11 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
             messengers = enriched.get("messengers") or []
             if channel not in messengers:
                 enriched["messengers"] = [*messengers, channel]
-        # New-lead text is not a perfect task-specific draft, but it is safer than
-        # an empty card and still requires Vladimir's manual review/send.
-        if not (enriched.get("suggested_message") or "").strip() and (L.get("timer_3min_text") or "").strip():
-            enriched["suggested_message"] = L.get("timer_3min_text")
+        # Safety gate (2026-05-15): do NOT fill task-specific suggested_message
+        # from new-lead timer_3min_text. That timer text is an emergency first-touch
+        # fallback and is not grounded in the task's CRM chat history / Message KB.
+        # If scheduler could not generate a task draft, iOS must show an empty draft
+        # and the operator must inspect/regenerate instead of seeing a generic text.
         return enriched
     enriched_tasks = [_enrich(t) for t in (tasks_today.get("tasks") or [])]
     enriched_completed = [_enrich(t) for t in (tasks_today.get("completed_today") or [])]

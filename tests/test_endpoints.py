@@ -182,7 +182,10 @@ def test_tasks_today_enriches_ui_context_from_leads_inbox(app_client, widget_hea
     assert task["last_message_channel"] == "whatsapp"
     assert "whatsapp" in task["messengers"]
     assert task["whatsapp_phone"]
-    assert task["suggested_message"].startswith("Наталья")
+    assert task["suggested_message"] == "", (
+        "GET /api/tasks/today must not reuse new-lead start_message/timer_3min_text "
+        "as a task-specific draft when scheduler supplied an empty suggested_message"
+    )
 
 
 def test_tasks_today_falls_back_to_phone_timezone_without_leads_inbox(app_client, widget_headers, internal_headers):
