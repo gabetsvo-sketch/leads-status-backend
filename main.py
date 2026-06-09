@@ -1879,12 +1879,17 @@ async def task_client_replied(
         raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
     target["action_state"] = "client_replied"
     target["client_replied_at"] = datetime.now(timezone.utc).isoformat()
+    preview = ""
     if isinstance(payload, dict):
         preview = (payload.get("preview") or "")[:300]
         if preview:
             target["client_reply_preview"] = preview
     save_tasks(tasks_today)
     log.info(f"task#{task_id}: client_replied")
+
+    # Background: auto-generate style draft for Vladimir's inbox
+    asyncio.create_task(_auto_draft_on_client_reply(dict(target), preview))
+
     return {"status": "ok", "task_id": task_id}
 
 
@@ -2655,14 +2660,16 @@ async def _style_write_draft(payload: dict, pack_id: str, pack_text: str = "") -
                 data = json.loads(resp.read())
                 if data.get("ok"):
                     return data.get("draft_text") or ""
+                # Server responded but declined (bad pack, etc.) — real failure
                 log.warning("style_draft: Mac server error: %s", data.get("error"))
                 return ""
         except _uerr.HTTPError as e:
             log.warning("style_draft: Mac server HTTP %d: %s", e.code, e.read().decode("utf-8", errors="replace")[:200])
             return ""
         except Exception as exc:
-            log.warning("style_draft: Mac server error: %s", exc)
-            return ""
+            # Network error (Mac off, ngrok down) — use placeholder so draft_api_unavailable is not set
+            log.warning("style_draft: Mac server unreachable: %s", exc)
+            return _fallback
 
     return await asyncio.to_thread(_call)
 
@@ -2928,6 +2935,125 @@ def _draft_public_response(draft: dict) -> dict:
     response = dict(draft)
     _sync_structured_variants_alias(response)
     return response
+
+async def _auto_draft_on_client_reply(task: dict, preview: str) -> None:
+    """Background: generate style-runtime draft when client replies; save as OfficeDraft."""
+    task_id = task.get("task_id")
+    lead_id = task.get("lead_id") or task_id
+    try:
+        # Determine channel
+        messengers = task.get("messengers") or []
+        pref = (task.get("preferred_channel") or "").lower()
+        if pref in ("whatsapp", "telegram", "email"):
+            channel = pref
+        elif any(("telegram" in str(m).lower()) for m in messengers):
+            channel = "telegram"
+        elif any(("whatsapp" in str(m).lower()) for m in messengers):
+            channel = "whatsapp"
+        else:
+            channel = "whatsapp"  # most common default
+
+        # Infer deal_stage from task action_state
+        action = (task.get("action_state") or "").lower()
+        if "replied" in action or "waiting" in action:
+            deal_stage = "question"
+        elif task.get("silence_days", 0) and int(task.get("silence_days", 0)) > 7:
+            deal_stage = "silence"
+        else:
+            deal_stage = "unknown"
+
+        # Build style-runtime payload (sanitized — no PII)
+        style_payload = {
+            "request_id": f"auto-{task_id}-{int(datetime.now(timezone.utc).timestamp())}",
+            "deal_ref": f"task_{task_id}",
+            "channel": channel,
+            "last_client_message_summary": (preview or "Клиент написал сообщение.")[:300],
+            "last_vladimir_message_summary": ((task.get("suggested_message") or "")[:200]) or None,
+            "silence_days": task.get("silence_days"),
+            "deal_stage": deal_stage,
+            "client_last_message_type": "question",
+            "facts_available": [],
+            "requested_output": "client_reply_draft",
+        }
+
+        pack_id, secondary_pack_ids, router_reason = _style_choose_pack(style_payload)
+        runtime_state = _style_load_runtime_pack(pack_id)
+        pack_text = runtime_state.get("pack_text") or ""
+        draft_text = await _style_write_draft(style_payload, pack_id, pack_text=pack_text)
+        draft_api_failed = bool(pack_text) and not draft_text
+        safety = _style_safety_gate(style_payload, draft_text, pack_id)
+
+        if draft_api_failed and not draft_text:
+            safety["pass"] = False
+            safety["flags"] = list(dict.fromkeys([*safety["flags"], "draft_api_unavailable"]))
+            safety["block_reason"] = safety.get("block_reason") or "Mac-сервер недоступен, черновик не сгенерирован."
+
+        # Only save draft if there is text to show
+        if not draft_text and not safety["pass"]:
+            log.info("auto_draft task#%s: skipped — no draft text and safety_pass=False (%s)", task_id, safety.get("flags"))
+            return
+
+        import uuid as _uuid
+        draft_id = f"style-auto-{task_id}-{_uuid.uuid4().hex[:8]}"
+        expires_at = (datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)).isoformat()
+
+        draft_payload = {
+            "draft_id": draft_id,
+            "entity_id": str(lead_id or task_id),
+            "text": draft_text or f"[Черновик заблокирован: {safety.get('block_reason', '')}]",
+            "category": "style_runtime",
+            "created_by_role": "style_engine",
+            "expires_at": expires_at,
+            "manual_review_only": True,
+            "pack_id": pack_id,
+            "risk_level": safety.get("risk_level", "low"),
+            "missing_facts": safety.get("missing_facts", []),
+            "safety_flags": safety.get("flags", []),
+            "block_reason": safety.get("block_reason"),
+        }
+
+        async with _office_drafts_lock:
+            existing = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+            if not existing:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                draft = {
+                    **draft_payload,
+                    "status": "pending",
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                    "version": 1,
+                    "approved_at": None, "approved_by": None, "approval_id": None,
+                    "edited_message": None, "edit_log": None, "reject_reason": None,
+                    "push_sent_count": 0, "consumed_at": None,
+                    "consumed_by_scheduler_at": None, "send_trace_id": None,
+                    "send_status": None, "claimed_at": None, "claimed_by": None,
+                    "claim_expires_at": None, "retry_count": 0, "next_retry_at": None,
+                    "expire_reason": None, "original_text": draft_payload["text"],
+                    "feedback_text": None, "needs_regen": False, "regen_count": 0,
+                    "last_feedback_at": None, "structured_variants": [], "variants": [],
+                    "selected_variant_id": None, "selected_variant_text": None,
+                    "selected_at": None, "selected_by": None, "selection_reason": None,
+                    "variant_history": [], "structured_variant_decisions": [],
+                }
+                office_drafts.append(draft)
+                save_office_drafts_atomic(office_drafts)
+
+        push_count = await send_push_to_all(
+            title="Черновик ответа",
+            body=(draft_text or "")[:80],
+            payload={"kind": "draft_ready", "draft_id": draft_id, "entity_id": str(lead_id or task_id)},
+        )
+        async with _office_drafts_lock:
+            target = next((d for d in office_drafts if d.get("draft_id") == draft_id), None)
+            if target:
+                target["push_sent_count"] = push_count
+                save_office_drafts_atomic(office_drafts)
+
+        log.info("auto_draft task#%s: created draft_id=%s pack=%s safety_pass=%s push=%s",
+                 task_id, draft_id, pack_id, safety["pass"], push_count)
+    except Exception as exc:
+        log.warning("auto_draft task#%s: error — %s", task_id, exc)
+
 
 # Statuses that block re-creation of a draft with the same draft_id.
 _DRAFT_TERMINAL_STATUSES = {
