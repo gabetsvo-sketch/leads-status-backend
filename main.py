@@ -2685,8 +2685,30 @@ async def _style_write_draft(payload: dict, pack_id: str, pack_text: str = "") -
         )
         return resp.content[0].text.strip() if resp.content else ""
     except Exception as exc:
-        log.warning("style_draft: Claude API error: %s", exc)
+        import traceback as _tb
+        log.warning("style_draft: Claude API error: %s — %s", type(exc).__name__, _tb.format_exc()[-800:])
         return ""
+
+
+@app.get("/style-runtime/v1/draft-health")
+async def style_draft_health(authorization: Optional[str] = Header(default=None)):
+    """Diagnostic: test Claude API connectivity from Render."""
+    check_office_write(authorization)
+    if not ANTHROPIC_API_KEY:
+        return {"ok": False, "error": "ANTHROPIC_API_KEY not set"}
+    try:
+        import anthropic as _anthropic
+        aclient = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        resp = await aclient.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=20,
+            system="Reply with OK.",
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        return {"ok": True, "text": resp.content[0].text if resp.content else "", "model": "claude-haiku-4-5-20251001"}
+    except Exception as exc:
+        import traceback as _tb
+        return {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:500], "traceback": _tb.format_exc()[-600:]}
 
 
 @app.post("/style-runtime/v1/draft")
