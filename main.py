@@ -2627,14 +2627,74 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str) -> dict:
     }
 
 
-def _style_write_draft(payload: dict, pack_id: str) -> str:
+async def _style_write_draft(payload: dict, pack_id: str, pack_text: str = "") -> str:
     channel = (payload.get("channel") or "app").lower()
-    prefix = "Коротко: " if channel in ("whatsapp", "telegram") else "Здравствуйте. "
-    if pack_id == "price_roi_explanation":
-        return prefix + "уточню актуальный источник по цене и вернусь с корректной информацией."
-    if pack_id == "silence_reactivation":
-        return prefix + "подскажу следующий шаг по подборке, если тема ещё актуальна."
-    return prefix + "по вашему вопросу сориентирую и предложу один понятный следующий шаг."
+    is_messenger = channel in ("whatsapp", "telegram")
+    _fallback_prefix = "Коротко: " if is_messenger else "Здравствуйте. "
+    _fallback = _fallback_prefix + "отвечу на вопрос и подскажу следующий шаг."
+
+    if not pack_text:
+        return _fallback
+    if not ANTHROPIC_API_KEY:
+        log.warning("style_draft: ANTHROPIC_API_KEY not set, using placeholder")
+        return _fallback
+
+    try:
+        import anthropic as _anthropic
+        aclient = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+        facts = payload.get("facts_available") or []
+        has_price_source = "price_source_ref" in facts
+        length_note = "1–3 предложения, как в WhatsApp/Telegram" if is_messenger else "3–5 предложений"
+        price_note = (
+            "Конкретные цены, проценты, доходность — НЕ упоминать: нет подтверждённого источника цены."
+            if not has_price_source else
+            "Конкретные цифры — только из подтверждённого источника, без выдумок."
+        )
+
+        situation_parts = []
+        if payload.get("last_client_message_summary"):
+            situation_parts.append(f"Последнее сообщение клиента (резюме): {payload['last_client_message_summary']}")
+        if payload.get("last_vladimir_message_summary"):
+            situation_parts.append(f"Последнее сообщение Владимира (резюме): {payload['last_vladimir_message_summary']}")
+        if payload.get("silence_days"):
+            situation_parts.append(f"Клиент молчал {payload['silence_days']} дней.")
+        if payload.get("deal_stage"):
+            situation_parts.append(f"Стадия сделки: {payload['deal_stage']}.")
+        if payload.get("client_situation_hint"):
+            situation_parts.append(f"Подсказка по ситуации: {payload['client_situation_hint']}.")
+
+        user_content = (
+            "\n".join(situation_parts)
+            + f"\n\nКанал: {channel}. Длина ответа: {length_note}. {price_note}"
+            + "\n\nНапиши черновик ответа Владимира. Только текст ответа, без заголовков и пояснений."
+        )
+
+        resp = await aclient.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=[
+                {
+                    "type": "text",
+                    "text": (
+                        "Ты помогаешь Владимиру — агенту по недвижимости в Пхукете — писать ответы клиентам. "
+                        "Используй стиль и паттерны из пака ниже: структуру, тон, типичные CTA. "
+                        "Не копируй фразы дословно — повторяй структуру и тон. "
+                        "Пиши только текст черновика ответа."
+                    ),
+                },
+                {
+                    "type": "text",
+                    "text": pack_text,
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            messages=[{"role": "user", "content": user_content}],
+        )
+        return resp.content[0].text.strip() if resp.content else ""
+    except Exception as exc:
+        log.warning("style_draft: Claude API error: %s", exc)
+        return ""
 
 
 @app.post("/style-runtime/v1/draft")
@@ -2661,13 +2721,19 @@ async def style_runtime_draft(
     if runtime_index and not _style_pack_in_index(runtime_index, pack_id):
         log.warning("style_runtime: selected pack %s absent from runtime index", pack_id)
 
-    draft_text = _style_write_draft(payload, pack_id)
+    pack_text = runtime_state.get("pack_text") or ""
+    draft_text = await _style_write_draft(payload, pack_id, pack_text=pack_text)
+    draft_api_failed = bool(pack_text) and not draft_text
     safety = _style_safety_gate(payload, draft_text, pack_id)
     runtime_block_reason = runtime_state.get("block_reason")
     if STYLE_RUNTIME_SOURCE in ("r2", "http") and not runtime_state.get("ok"):
         safety["pass"] = False
         safety["flags"] = list(dict.fromkeys([*safety["flags"], "runtime_pack_unavailable"]))
         safety["block_reason"] = f"Style runtime {STYLE_RUNTIME_SOURCE.upper()} snapshot unavailable: {runtime_block_reason}"
+    if draft_api_failed and not draft_text:
+        safety["pass"] = False
+        safety["flags"] = list(dict.fromkeys([*safety["flags"], "draft_api_unavailable"]))
+        safety["block_reason"] = safety.get("block_reason") or "Claude API недоступен, черновик не сгенерирован."
     if not safety["pass"]:
         draft_text = ""
 
