@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.leadsstatus.style-runtime-publish</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/vladimir/Documents/Claude code/Tasks/assistant/embed_service/.venv/bin/python</string>
+        <string>/Users/vladimir/.hermes/bin/publish_style_runtime_local.py</string>
+        <string>--publish</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/vladimir/Library/Logs/style-runtime-publish.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/vladimir/Library/Logs/style-runtime-publish.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <key>STYLE_RUNTIME_OBSIDIAN_DIR</key>
+        <string>/Users/vladimir/Desktop/Obsidian/Хранилище 1/Assist - Real estate/office/style-engine/runtime</string>
+        <key>STYLE_RUNTIME_PUBLIC_DIR</key>
+        <string>/Users/vladimir/.hermes/style-runtime-public</string>
+    </dict>
+</dict>
+</plist>
