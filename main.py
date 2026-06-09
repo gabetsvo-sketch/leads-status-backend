@@ -102,6 +102,7 @@ TIMER_15MIN_SEC = int(os.environ.get("TIMER_15MIN_SEC", "900"))
 TIMER_LOOP_INTERVAL_SEC = int(os.environ.get("TIMER_LOOP_INTERVAL_SEC", "60"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 RED_EMOJIS = set("🔴🟥🛑⛔🚫🚩🔻")
 GREEN_EMOJIS = set("🟢🟩✅🔺")
@@ -2635,13 +2636,13 @@ async def _style_write_draft(payload: dict, pack_id: str, pack_text: str = "") -
 
     if not pack_text:
         return _fallback
-    if not ANTHROPIC_API_KEY:
-        log.warning("style_draft: ANTHROPIC_API_KEY not set, using placeholder")
+    if not OPENAI_API_KEY:
+        log.warning("style_draft: OPENAI_API_KEY not set, using placeholder")
         return _fallback
 
     try:
-        import anthropic as _anthropic
-        aclient = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        import openai as _openai
+        aclient = _openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
         facts = payload.get("facts_available") or []
         has_price_source = "price_source_ref" in facts
@@ -2677,35 +2678,36 @@ async def _style_write_draft(payload: dict, pack_id: str, pack_text: str = "") -
             "Пиши только текст черновика ответа, без заголовков и пояснений.\n\n"
             + pack_text
         )
-        resp = await aclient.messages.create(
-            model="claude-haiku-4-5-20251001",
+        resp = await aclient.chat.completions.create(
+            model="gpt-4o-mini",
             max_tokens=300,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
         )
-        return resp.content[0].text.strip() if resp.content else ""
+        return (resp.choices[0].message.content or "").strip()
     except Exception as exc:
         import traceback as _tb
-        log.warning("style_draft: Claude API error: %s — %s", type(exc).__name__, _tb.format_exc()[-800:])
+        log.warning("style_draft: OpenAI API error: %s — %s", type(exc).__name__, _tb.format_exc()[-800:])
         return ""
 
 
 @app.get("/style-runtime/v1/draft-health")
 async def style_draft_health(authorization: Optional[str] = Header(default=None)):
-    """Diagnostic: test Claude API connectivity from Render."""
+    """Diagnostic: test OpenAI API connectivity from Render."""
     check_office_write(authorization)
-    if not ANTHROPIC_API_KEY:
-        return {"ok": False, "error": "ANTHROPIC_API_KEY not set"}
+    if not OPENAI_API_KEY:
+        return {"ok": False, "error": "OPENAI_API_KEY not set"}
     try:
-        import anthropic as _anthropic
-        aclient = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-        resp = await aclient.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=20,
-            system="Reply with OK.",
+        import openai as _openai
+        aclient = _openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+        resp = await aclient.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=10,
             messages=[{"role": "user", "content": "ping"}],
         )
-        return {"ok": True, "text": resp.content[0].text if resp.content else "", "model": "claude-haiku-4-5-20251001"}
+        return {"ok": True, "text": (resp.choices[0].message.content or "").strip(), "model": "gpt-4o-mini"}
     except Exception as exc:
         import traceback as _tb
         return {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:500], "traceback": _tb.format_exc()[-600:]}

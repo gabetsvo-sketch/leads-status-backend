@@ -41,3 +41,5 @@ services:
         sync: false
       - key: STYLE_RUNTIME_HTTP_TOKEN
         sync: false
+      - key: OPENAI_API_KEY
+        sync: false
