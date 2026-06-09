@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.leadsstatus.style-runtime-server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/vladimir/.hermes/bin/style_runtime_server.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/vladimir/Library/Logs/style-runtime-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/vladimir/Library/Logs/style-runtime-server.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <key>STYLE_RUNTIME_PUBLIC_DIR</key>
+        <string>/Users/vladimir/.hermes/style-runtime-public</string>
+        <key>STYLE_RUNTIME_HTTP_PORT</key>
+        <string>8901</string>
+    </dict>
+</dict>
+</plist>

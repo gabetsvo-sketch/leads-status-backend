@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.leadsstatus.ngrok-style-runtime</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/ngrok</string>
+        <string>http</string>
+        <string>8901</string>
+        <string>--domain=thing-nuptials-drier.ngrok-free.dev</string>
+        <string>--log=stdout</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/vladimir/Library/Logs/ngrok-style-runtime.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/vladimir/Library/Logs/ngrok-style-runtime.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/vladimir</string>
+    </dict>
+</dict>
+</plist>

@@ -1,7 +1,10 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -67,6 +70,20 @@ SCHEDULER_HEARTBEAT_FILE = Path(os.environ.get("SCHEDULER_HEARTBEAT_FILE", "/var
 OFFICE_TOKEN = os.environ.get("OFFICE_TOKEN", "").strip() or INTERNAL_TOKEN
 OFFICE_DRAFTS_FILE = Path(os.environ.get("OFFICE_DRAFTS_FILE", "/var/data/office_drafts.json"))
 DRAFT_FEEDBACK_LOG = Path(os.environ.get("DRAFT_FEEDBACK_LOG", "/var/data/draft_feedback_log.jsonl"))
+STYLE_RUNTIME_DIR = Path(os.environ.get(
+    "STYLE_RUNTIME_DIR",
+    "/Users/vladimir/Desktop/Obsidian/Хранилище 1/Assist - Real estate/office/style-engine/runtime",
+))
+STYLE_RUNTIME_SOURCE = os.environ.get("STYLE_RUNTIME_SOURCE", "local").strip().lower()
+STYLE_RUNTIME_R2_ENDPOINT = os.environ.get("STYLE_RUNTIME_R2_ENDPOINT", "").strip()
+STYLE_RUNTIME_R2_BUCKET = os.environ.get("STYLE_RUNTIME_R2_BUCKET", "").strip()
+STYLE_RUNTIME_R2_PREFIX = os.environ.get("STYLE_RUNTIME_R2_PREFIX", "style-runtime/v1/latest").strip().strip("/")
+STYLE_RUNTIME_CACHE_TTL_SECONDS = int(os.environ.get("STYLE_RUNTIME_CACHE_TTL_SECONDS", "600"))
+STYLE_RUNTIME_R2_ACCESS_KEY_ID = os.environ.get("STYLE_RUNTIME_R2_ACCESS_KEY_ID", "").strip()
+STYLE_RUNTIME_R2_SECRET_ACCESS_KEY = os.environ.get("STYLE_RUNTIME_R2_SECRET_ACCESS_KEY", "").strip()
+STYLE_RUNTIME_FEEDBACK_FILE = Path(os.environ.get("STYLE_RUNTIME_FEEDBACK_FILE", "/var/data/style_runtime_feedback.jsonl"))
+STYLE_RUNTIME_HTTP_BASE_URL = os.environ.get("STYLE_RUNTIME_HTTP_BASE_URL", "").strip().rstrip("/")
+STYLE_RUNTIME_HTTP_TOKEN = os.environ.get("STYLE_RUNTIME_HTTP_TOKEN", "").strip()
 
 # APNs config (build 20). Файл .p8 либо лежит на диске (APNS_AUTH_KEY_FILE),
 # либо передаётся целиком через env (APNS_AUTH_KEY_CONTENT) — для Render.
@@ -2306,6 +2323,429 @@ async def get_anthropic_health(authorization: Optional[str] = Header(default=Non
 
 
 # ---------------------------------------------------------------------------
+# Style Runtime v1 — safe draft/feedback adapter for LeadsStatus app-flow
+#
+# This lives inside LeadsStatus backend for V1: no live-send, no CRM writes,
+# internal/office auth only, sanitized payloads only, and manual_review_only=true
+# in every draft response. The implementation is intentionally deterministic so
+# tests can verify the safety boundary before any model-backed writer is wired.
+# ---------------------------------------------------------------------------
+
+_PII_PATTERNS = (
+    re.compile(r"\+?\d[\d\s().-]{8,}\d"),  # phone-like
+    re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I),
+    re.compile(r"https?://|amocrm\.ru|/leads/detail/", re.I),
+    re.compile(r"@[A-Za-z0-9_]{3,}"),
+)
+
+_STYLE_FEEDBACK_TYPES = {
+    "too_long", "too_short", "not_my_style", "wrong_pack", "missing_fact",
+    "too_salesy", "too_cold", "unsafe_claim", "needs_direct_answer", "other",
+    # Runtime spec aliases from feedback-intake-schema.md
+    "too_pushy", "not_direct_answer", "wrong_fact", "not_my_words", "bad_cta",
+    "needs_more_warmth", "needs_more_expertise",
+}
+_STYLE_USER_ACTIONS = {
+    "approved", "edited_approved", "edited_and_approved", "rejected",
+    "regenerated", "manual_reply_used",
+}
+
+
+def _style_text_has_pii(value) -> bool:
+    text = str(value or "")
+    return any(p.search(text) for p in _PII_PATTERNS)
+
+
+def _assert_style_payload_no_pii(payload: dict, fields: tuple[str, ...]) -> None:
+    for field in fields:
+        value = payload.get(field)
+        if isinstance(value, str) and _style_text_has_pii(value):
+            raise HTTPException(status_code=400, detail=f"PII/raw data detected in {field}")
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and _style_text_has_pii(item):
+                    raise HTTPException(status_code=400, detail=f"PII/raw data detected in {field}")
+
+
+_STYLE_RUNTIME_R2_CACHE: Optional[dict] = None
+_STYLE_RUNTIME_R2_LAST_GOOD: Optional[dict] = None
+_STYLE_RUNTIME_HTTP_CACHE: Optional[dict] = None
+_STYLE_RUNTIME_HTTP_LAST_GOOD: Optional[dict] = None
+
+
+def _style_sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _style_pack_entries(index: dict) -> list[dict]:
+    packs = index.get("packs") if isinstance(index, dict) else None
+    if isinstance(packs, dict):
+        return [dict({"pack_id": k}, **(v if isinstance(v, dict) else {})) for k, v in packs.items()]
+    if isinstance(packs, list):
+        return [p for p in packs if isinstance(p, dict)]
+    return []
+
+
+def _style_pack_in_index(index: dict, pack_id: str) -> bool:
+    return any(p.get("pack_id") == pack_id for p in _style_pack_entries(index))
+
+
+def _style_load_runtime_index() -> dict:
+    path = STYLE_RUNTIME_DIR / "style-runtime-index-v1.json"
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            log.warning("style_runtime: failed to parse runtime index at %s", path)
+    return {}
+
+
+def _style_runtime_create_r2_client():
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError("boto3 is required for STYLE_RUNTIME_SOURCE=r2") from exc
+    return boto3.client(
+        "s3",
+        endpoint_url=STYLE_RUNTIME_R2_ENDPOINT or None,
+        aws_access_key_id=STYLE_RUNTIME_R2_ACCESS_KEY_ID or None,
+        aws_secret_access_key=STYLE_RUNTIME_R2_SECRET_ACCESS_KEY or None,
+    )
+
+
+def _style_r2_key(relative_path: str) -> str:
+    rel = relative_path.strip().lstrip("/")
+    return f"{STYLE_RUNTIME_R2_PREFIX}/{rel}" if STYLE_RUNTIME_R2_PREFIX else rel
+
+
+def _style_r2_read_text(client, relative_path: str) -> str:
+    response = client.get_object(Bucket=STYLE_RUNTIME_R2_BUCKET, Key=_style_r2_key(relative_path))
+    body = response["Body"].read()
+    return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
+
+
+def _style_manifest_pack(manifest: dict, pack_id: str) -> Optional[dict]:
+    for pack in manifest.get("packs") or []:
+        if isinstance(pack, dict) and pack.get("pack_id") == pack_id:
+            return pack
+    return None
+
+
+def _style_guarded_runtime_state(source: str, reason: str, *, index: Optional[dict] = None) -> dict:
+    return {
+        "ok": False,
+        "source": source,
+        "index": index or {},
+        "pack_text": "",
+        "pack_path": None,
+        "pack_sha256": None,
+        "snapshot_version": None,
+        "block_reason": reason,
+    }
+
+
+def _style_fetch_r2_snapshot(pack_id: str) -> dict:
+    if not STYLE_RUNTIME_R2_BUCKET:
+        raise RuntimeError("STYLE_RUNTIME_R2_BUCKET is required")
+    client = _style_runtime_create_r2_client()
+    manifest_text = _style_r2_read_text(client, "manifest.json")
+    manifest = json.loads(manifest_text)
+    if manifest.get("manual_review_only") is not True:
+        raise RuntimeError("manifest manual_review_only must be true")
+    index_meta = manifest.get("runtime_index") or {}
+    index_path = index_meta.get("path") or "style-runtime-index-v1.json"
+    index_text = _style_r2_read_text(client, index_path)
+    expected_index_hash = index_meta.get("sha256")
+    if expected_index_hash and _style_sha256_text(index_text) != expected_index_hash:
+        raise RuntimeError("runtime index hash mismatch")
+    index = json.loads(index_text)
+    pack_meta = _style_manifest_pack(manifest, pack_id)
+    if not pack_meta:
+        raise RuntimeError(f"missing pack in manifest: {pack_id}")
+    pack_path = pack_meta.get("path") or f"packs/{pack_id}.md"
+    pack_text = _style_r2_read_text(client, pack_path)
+    expected_pack_hash = pack_meta.get("sha256")
+    actual_pack_hash = _style_sha256_text(pack_text)
+    if expected_pack_hash and actual_pack_hash != expected_pack_hash:
+        raise RuntimeError(f"pack hash mismatch: {pack_id}")
+    return {
+        "ok": True,
+        "source": "r2",
+        "index": index if isinstance(index, dict) else {},
+        "pack_text": pack_text,
+        "pack_path": pack_path,
+        "pack_sha256": actual_pack_hash,
+        "snapshot_version": manifest.get("published_at"),
+        "block_reason": None,
+    }
+
+
+def _style_fetch_http_snapshot(pack_id: str) -> dict:
+    import urllib.request
+    if not STYLE_RUNTIME_HTTP_BASE_URL:
+        raise RuntimeError("STYLE_RUNTIME_HTTP_BASE_URL is required for STYLE_RUNTIME_SOURCE=http")
+    base = STYLE_RUNTIME_HTTP_BASE_URL
+
+    def http_get(path: str) -> str:
+        url = f"{base}/{path.lstrip('/')}"
+        req = urllib.request.Request(url)
+        if STYLE_RUNTIME_HTTP_TOKEN:
+            req.add_header("X-Style-Token", STYLE_RUNTIME_HTTP_TOKEN)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode("utf-8")
+
+    manifest_text = http_get("v1/latest/manifest.json")
+    manifest = json.loads(manifest_text)
+    if manifest.get("manual_review_only") is not True:
+        raise RuntimeError("manifest manual_review_only must be true")
+    index_meta = manifest.get("runtime_index") or {}
+    index_path = index_meta.get("path") or "style-runtime-index-v1.json"
+    index_text = http_get(f"v1/latest/{index_path}")
+    expected_index_hash = index_meta.get("sha256")
+    if expected_index_hash and _style_sha256_text(index_text) != expected_index_hash:
+        raise RuntimeError("runtime index hash mismatch")
+    index = json.loads(index_text)
+    pack_meta = _style_manifest_pack(manifest, pack_id)
+    if not pack_meta:
+        raise RuntimeError(f"missing pack in manifest: {pack_id}")
+    pack_path = pack_meta.get("path") or f"packs/{pack_id}.md"
+    pack_text = http_get(f"v1/latest/{pack_path}")
+    expected_pack_hash = pack_meta.get("sha256")
+    actual_pack_hash = _style_sha256_text(pack_text)
+    if expected_pack_hash and actual_pack_hash != expected_pack_hash:
+        raise RuntimeError(f"pack hash mismatch: {pack_id}")
+    return {
+        "ok": True,
+        "source": "http",
+        "index": index if isinstance(index, dict) else {},
+        "pack_text": pack_text,
+        "pack_path": pack_path,
+        "pack_sha256": actual_pack_hash,
+        "snapshot_version": manifest.get("published_at"),
+        "block_reason": None,
+    }
+
+
+def _style_load_runtime_pack(pack_id: str) -> dict:
+    global _STYLE_RUNTIME_R2_CACHE, _STYLE_RUNTIME_R2_LAST_GOOD, _STYLE_RUNTIME_HTTP_CACHE, _STYLE_RUNTIME_HTTP_LAST_GOOD
+    if STYLE_RUNTIME_SOURCE not in ("r2", "http"):
+        index = _style_load_runtime_index()
+        return {
+            "ok": False,
+            "source": "local",
+            "index": index,
+            "pack_text": "",
+            "pack_path": None,
+            "pack_sha256": None,
+            "snapshot_version": None,
+            "block_reason": None,
+        }
+
+    if STYLE_RUNTIME_SOURCE == "http":
+        cache_ref = _STYLE_RUNTIME_HTTP_CACHE
+        last_good_ref = _STYLE_RUNTIME_HTTP_LAST_GOOD
+        fetch_fn = _style_fetch_http_snapshot
+    else:
+        cache_ref = _STYLE_RUNTIME_R2_CACHE
+        last_good_ref = _STYLE_RUNTIME_R2_LAST_GOOD
+        fetch_fn = _style_fetch_r2_snapshot
+
+    source_name = STYLE_RUNTIME_SOURCE
+    now = time.time()
+    if cache_ref and cache_ref.get("pack_id") == pack_id and now - cache_ref.get("loaded_at", 0) <= STYLE_RUNTIME_CACHE_TTL_SECONDS:
+        state = dict(cache_ref["state"])
+        state["source"] = f"{source_name}_cache"
+        return state
+
+    try:
+        state = fetch_fn(pack_id)
+        new_cache = {"pack_id": pack_id, "loaded_at": now, "state": state}
+        if STYLE_RUNTIME_SOURCE == "http":
+            _STYLE_RUNTIME_HTTP_CACHE = new_cache
+            _STYLE_RUNTIME_HTTP_LAST_GOOD = {"pack_id": pack_id, "state": state}
+        else:
+            _STYLE_RUNTIME_R2_CACHE = new_cache
+            _STYLE_RUNTIME_R2_LAST_GOOD = {"pack_id": pack_id, "state": state}
+        return state
+    except Exception as exc:
+        reason = str(exc)
+        log.warning("style_runtime: %s snapshot unavailable/rejected: %s", source_name, reason)
+        if last_good_ref and last_good_ref.get("pack_id") == pack_id:
+            last_good = dict(last_good_ref["state"])
+            last_good["source"] = f"{source_name}_last_good"
+            return last_good
+        return _style_guarded_runtime_state(source_name, reason)
+
+
+def _style_choose_pack(payload: dict) -> tuple[str, list[str], str]:
+    text = " ".join(str(payload.get(k) or "") for k in (
+        "client_situation_hint", "last_client_message_summary", "deal_stage", "client_last_message_type",
+    )).lower()
+    if any(k in text for k in ("цена", "price", "roi", "доход", "окуп", "рассроч", "payment")):
+        return "price_roi_explanation", ["client_asks_question"], "Запрос связан с ценой/деньгами, поэтому выбран денежный pack с жёстким safety gate."
+    if payload.get("silence_days") not in (None, "", 0) or "silence" in text or "молч" in text:
+        return "silence_reactivation", [], "Сценарий похож на реактивацию после паузы."
+    return "client_asks_question", [], "Клиент задаёт обычный вопрос/просит следующий шаг."
+
+
+def _style_count_cta(text: str) -> int:
+    if not text:
+        return 0
+    return min(text.count("?") + sum(1 for marker in ("напишите", "скажи", "скажите", "удобно") if marker in text.lower()), 3)
+
+
+def _style_safety_gate(payload: dict, draft_text: str, pack_id: str) -> dict:
+    facts = set(payload.get("facts_available") or [])
+    summary = " ".join(str(payload.get(k) or "") for k in ("client_situation_hint", "last_client_message_summary")).lower()
+    flags = []
+    missing = []
+    risk = "low"
+
+    price_intent = pack_id == "price_roi_explanation" or any(k in summary for k in ("цена", "price", "roi", "доход", "окуп", "рассроч"))
+    if price_intent:
+        risk = "high"
+        if "price_source_ref" not in facts:
+            flags.append("price_without_source")
+            missing.append("price_source_ref")
+    if any(k in summary for k in ("договор", "юрид", "freehold", "leasehold", "платеж", "платёж")):
+        risk = "high"
+    cta_count = _style_count_cta(draft_text)
+    if cta_count > 1:
+        flags.append("too_many_cta")
+    if _style_text_has_pii(draft_text):
+        flags.append("pii_detected")
+    safety_pass = not any(f in flags for f in ("price_without_source", "pii_detected", "too_many_cta"))
+    return {
+        "pass": safety_pass,
+        "risk_level": risk,
+        "flags": flags,
+        "missing_facts": missing,
+        "cta_count": 0 if not safety_pass else cta_count,
+        "show_to_vladimir": True,
+        "block_reason": None if safety_pass else "Нельзя показывать как готовый черновик: не хватает подтверждённых фактов или есть safety-флаг.",
+    }
+
+
+def _style_write_draft(payload: dict, pack_id: str) -> str:
+    channel = (payload.get("channel") or "app").lower()
+    prefix = "Коротко: " if channel in ("whatsapp", "telegram") else "Здравствуйте. "
+    if pack_id == "price_roi_explanation":
+        return prefix + "уточню актуальный источник по цене и вернусь с корректной информацией."
+    if pack_id == "silence_reactivation":
+        return prefix + "подскажу следующий шаг по подборке, если тема ещё актуальна."
+    return prefix + "по вашему вопросу сориентирую и предложу один понятный следующий шаг."
+
+
+@app.post("/style-runtime/v1/draft")
+async def style_runtime_draft(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    check_office_write(authorization)
+    required = (
+        "request_id", "deal_ref", "channel", "deal_stage", "client_last_message_type", "requested_output",
+    )
+    missing_required = [k for k in required if payload.get(k) in (None, "")]
+    if missing_required:
+        raise HTTPException(status_code=400, detail=f"missing required fields: {', '.join(missing_required)}")
+    if payload.get("requested_output") != "client_reply_draft":
+        raise HTTPException(status_code=400, detail="requested_output must be client_reply_draft")
+    _assert_style_payload_no_pii(payload, (
+        "deal_ref", "client_situation_hint", "last_client_message_summary", "last_vladimir_message_summary", "facts_available",
+    ))
+
+    pack_id, secondary_pack_ids, router_reason = _style_choose_pack(payload)
+    runtime_state = _style_load_runtime_pack(pack_id)
+    runtime_index = runtime_state.get("index") or {}
+    if runtime_index and not _style_pack_in_index(runtime_index, pack_id):
+        log.warning("style_runtime: selected pack %s absent from runtime index", pack_id)
+
+    draft_text = _style_write_draft(payload, pack_id)
+    safety = _style_safety_gate(payload, draft_text, pack_id)
+    runtime_block_reason = runtime_state.get("block_reason")
+    if STYLE_RUNTIME_SOURCE in ("r2", "http") and not runtime_state.get("ok"):
+        safety["pass"] = False
+        safety["flags"] = list(dict.fromkeys([*safety["flags"], "runtime_pack_unavailable"]))
+        safety["block_reason"] = f"Style runtime {STYLE_RUNTIME_SOURCE.upper()} snapshot unavailable: {runtime_block_reason}"
+    if not safety["pass"]:
+        draft_text = ""
+
+    return {
+        "request_id": payload["request_id"],
+        "draft_text": draft_text,
+        "variant": "main",
+        "pack_id": pack_id,
+        "secondary_pack_ids": secondary_pack_ids[:2],
+        "manual_review_only": True,
+        "used_facts": sorted(set(payload.get("facts_available") or []) - set(safety["missing_facts"])),
+        "missing_facts": safety["missing_facts"],
+        "cta_count": safety["cta_count"],
+        "safety_pass": safety["pass"],
+        "risk_level": safety["risk_level"],
+        "safety_flags": safety["flags"],
+        "router_reason": router_reason,
+        "runtime_source": runtime_state.get("source"),
+        "runtime_pack_loaded": bool(runtime_state.get("ok")),
+        "runtime_pack_path": runtime_state.get("pack_path"),
+        "runtime_pack_sha256": runtime_state.get("pack_sha256"),
+        "runtime_snapshot_version": runtime_state.get("snapshot_version"),
+        "runtime_block_reason": runtime_block_reason,
+        "show_to_vladimir": safety["show_to_vladimir"],
+        "block_reason": safety["block_reason"],
+        "send_performed": False,
+        "crm_mutated": False,
+    }
+
+
+@app.post("/style-runtime/v1/feedback")
+async def style_runtime_feedback(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    check_office_write(authorization)
+    required = ("event_id", "deal_ref", "selected_pack_id", "draft_id", "feedback_type", "user_action")
+    missing_required = [k for k in required if payload.get(k) in (None, "")]
+    if missing_required:
+        raise HTTPException(status_code=400, detail=f"missing required fields: {', '.join(missing_required)}")
+    feedback_type = payload.get("feedback_type")
+    if feedback_type not in _STYLE_FEEDBACK_TYPES:
+        raise HTTPException(status_code=400, detail="unknown feedback_type")
+    user_action = payload.get("user_action")
+    if user_action not in _STYLE_USER_ACTIONS:
+        raise HTTPException(status_code=400, detail="unknown user_action")
+    _assert_style_payload_no_pii(payload, (
+        "deal_ref", "message_context_ref", "selected_pack_id", "draft_id", "feedback_text_sanitized",
+    ))
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    event = {
+        "event_id": payload["event_id"],
+        "created_at": payload.get("created_at") or now_iso,
+        "app_user": payload.get("app_user") or "vladimir",
+        "request_id": payload.get("request_id"),
+        "deal_ref": payload["deal_ref"],
+        "message_context_ref": payload.get("message_context_ref"),
+        "selected_pack_id": payload["selected_pack_id"],
+        "secondary_pack_ids": payload.get("secondary_pack_ids") or [],
+        "draft_id": payload["draft_id"],
+        "draft_version": payload.get("draft_version") or 1,
+        "feedback_type": feedback_type,
+        "feedback_text_sanitized": (payload.get("feedback_text_sanitized") or "").strip(),
+        "before_features": payload.get("before_features") or {},
+        "after_features": payload.get("after_features") or {},
+        "user_action": user_action,
+        "promotion_status": payload.get("promotion_status") or "candidate_observation",
+        "no_send_side_effect": True,
+        "crm_mutated": False,
+    }
+    STYLE_RUNTIME_FEEDBACK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with STYLE_RUNTIME_FEEDBACK_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    return {"status": "ok", "event_id": event["event_id"], "promotion_status": event["promotion_status"]}
+
+
+# ---------------------------------------------------------------------------
 # Packet C — Office draft inbox (approval bridge between office pipeline and iOS)
 #
 # POST  /api/office/drafts                         auth: OFFICE_TOKEN — office creates draft
@@ -2426,6 +2866,10 @@ _DRAFT_TERMINAL_STATUSES = {
     "dry_run_consumed", "send_failed", "expired",
 }
 
+_STYLE_DRAFT_CONTEXT_FIELDS = (
+    "pack_id", "risk_level", "missing_facts", "safety_flags", "block_reason", "manual_review_only",
+)
+
 _CLAIM_TTL_SECONDS = 600  # 10 minutes
 
 
@@ -2489,7 +2933,7 @@ async def office_drafts_create(
                 existing.setdefault("structured_variant_decisions", [])
             else:
                 _sync_structured_variants_alias(existing)
-            for field in ("category", "incoming_msg_id", "context_watermark", "created_by_role", "trace_id"):
+            for field in ("category", "incoming_msg_id", "context_watermark", "created_by_role", "trace_id", *_STYLE_DRAFT_CONTEXT_FIELDS):
                 if field in payload:
                     existing[field] = payload[field]
             save_office_drafts_atomic(office_drafts)
@@ -2542,6 +2986,9 @@ async def office_drafts_create(
             "variant_history": [],
             "structured_variant_decisions": [],
         }
+        for field in _STYLE_DRAFT_CONTEXT_FIELDS:
+            if field in payload:
+                draft[field] = payload[field]
         office_drafts.append(draft)
         save_office_drafts_atomic(office_drafts)
 
