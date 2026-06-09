@@ -36,7 +36,8 @@ log = logging.getLogger("style_runtime_server")
 PUBLIC_DIR = Path(os.environ.get("STYLE_RUNTIME_PUBLIC_DIR", "~/.hermes/style-runtime-public")).expanduser().resolve()
 PORT = int(os.environ.get("STYLE_RUNTIME_HTTP_PORT", "8901"))
 READ_TOKEN = os.environ.get("STYLE_RUNTIME_READ_TOKEN", "").strip()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
 
 ALLOWED_GET_RE = re.compile(
     r"^(/health|/v1/latest/manifest\.json|/v1/latest/style-runtime-index-v1\.json|/v1/latest/packs/[A-Za-z0-9_.-]+\.md)$"
@@ -140,9 +141,6 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
         self._send_json(200, result)
 
     def _generate_draft(self, pack_id: str, payload: dict) -> dict:
-        if not OPENAI_API_KEY:
-            return {"ok": False, "error": "OPENAI_API_KEY not set on Mac server"}
-
         pack_path = PUBLIC_DIR / "v1" / "latest" / "packs" / f"{pack_id}.md"
         if not pack_path.is_file():
             return {"ok": False, "error": f"pack not found: {pack_id}"}
@@ -188,9 +186,11 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
             + pack_text
         )
 
+        # Ollama local inference — no API key required
         api_body = json.dumps({
-            "model": "gpt-4o-mini",
-            "max_tokens": 300,
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "options": {"num_predict": 300},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
@@ -198,26 +198,19 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
         }).encode("utf-8")
 
         req = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
+            f"{OLLAMA_BASE_URL}/api/chat",
             data=api_body,
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read())
-                text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-                log.info("style_draft: generated %d chars for pack %s", len(text), pack_id)
+                text = (data.get("message") or {}).get("content", "").strip()
+                log.info("style_draft: generated %d chars for pack %s via Ollama/%s", len(text), pack_id, OLLAMA_MODEL)
                 return {"ok": True, "draft_text": text}
-        except urllib.error.HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")[:300]
-            log.warning("style_draft: OpenAI HTTP %d: %s", e.code, err)
-            return {"ok": False, "error": f"OpenAI HTTP {e.code}: {err}"}
         except Exception as e:
-            log.warning("style_draft: OpenAI error: %s", e)
+            log.warning("style_draft: Ollama error: %s", e)
             return {"ok": False, "error": str(e)[:300]}
 
 
@@ -233,10 +226,7 @@ def main() -> None:
         log.info("token auth: enabled (X-Style-Token required)")
     else:
         log.info("token auth: disabled")
-    if OPENAI_API_KEY:
-        log.info("OpenAI draft generation: enabled (gpt-4o-mini)")
-    else:
-        log.warning("OpenAI draft generation: OPENAI_API_KEY not set — POST /v1/draft will fail")
+    log.info("draft generation: Ollama/%s at %s (no API key required)", OLLAMA_MODEL, OLLAMA_BASE_URL)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

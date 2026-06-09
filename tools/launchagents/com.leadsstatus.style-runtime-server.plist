@@ -30,8 +30,10 @@
         <string>/Users/vladimir/.hermes/style-runtime-public</string>
         <key>STYLE_RUNTIME_HTTP_PORT</key>
         <string>8901</string>
-        <key>OPENAI_API_KEY</key>
-        <string>REPLACE_WITH_OPENAI_API_KEY</string>
+        <key>OLLAMA_BASE_URL</key>
+        <string>http://localhost:11434</string>
+        <key>OLLAMA_MODEL</key>
+        <string>qwen2.5:14b</string>
     </dict>
 </dict>
 </plist>
