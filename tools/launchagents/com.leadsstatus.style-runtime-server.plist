@@ -30,6 +30,8 @@
         <string>/Users/vladimir/.hermes/style-runtime-public</string>
         <key>STYLE_RUNTIME_HTTP_PORT</key>
         <string>8901</string>
+        <key>OPENAI_API_KEY</key>
+        <string>REPLACE_WITH_OPENAI_API_KEY</string>
     </dict>
 </dict>
 </plist>

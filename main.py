@@ -2631,86 +2631,74 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str) -> dict:
 async def _style_write_draft(payload: dict, pack_id: str, pack_text: str = "") -> str:
     channel = (payload.get("channel") or "app").lower()
     is_messenger = channel in ("whatsapp", "telegram")
-    _fallback_prefix = "Коротко: " if is_messenger else "Здравствуйте. "
-    _fallback = _fallback_prefix + "отвечу на вопрос и подскажу следующий шаг."
+    _fallback = ("Коротко: " if is_messenger else "Здравствуйте. ") + "отвечу на вопрос и подскажу следующий шаг."
 
     if not pack_text:
         return _fallback
-    if not OPENAI_API_KEY:
-        log.warning("style_draft: OPENAI_API_KEY not set, using placeholder")
+
+    http_base = (STYLE_RUNTIME_HTTP_BASE_URL or "").rstrip("/")
+    http_token = STYLE_RUNTIME_HTTP_TOKEN or ""
+    if not http_base:
+        log.warning("style_draft: STYLE_RUNTIME_HTTP_BASE_URL not set, using placeholder")
         return _fallback
 
-    try:
-        import openai as _openai
-        aclient = _openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+    import urllib.request as _req, urllib.error as _uerr
 
-        facts = payload.get("facts_available") or []
-        has_price_source = "price_source_ref" in facts
-        length_note = "1–3 предложения, как в WhatsApp/Telegram" if is_messenger else "3–5 предложений"
-        price_note = (
-            "Конкретные цены, проценты, доходность — НЕ упоминать: нет подтверждённого источника цены."
-            if not has_price_source else
-            "Конкретные цифры — только из подтверждённого источника, без выдумок."
-        )
+    def _call() -> str:
+        body = json.dumps({"pack_id": pack_id, "payload": payload}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if http_token:
+            headers["X-Style-Token"] = http_token
+        req = _req.Request(f"{http_base}/v1/draft", data=body, headers=headers, method="POST")
+        try:
+            with _req.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+                if data.get("ok"):
+                    return data.get("draft_text") or ""
+                log.warning("style_draft: Mac server error: %s", data.get("error"))
+                return ""
+        except _uerr.HTTPError as e:
+            log.warning("style_draft: Mac server HTTP %d: %s", e.code, e.read().decode("utf-8", errors="replace")[:200])
+            return ""
+        except Exception as exc:
+            log.warning("style_draft: Mac server error: %s", exc)
+            return ""
 
-        situation_parts = []
-        if payload.get("last_client_message_summary"):
-            situation_parts.append(f"Последнее сообщение клиента (резюме): {payload['last_client_message_summary']}")
-        if payload.get("last_vladimir_message_summary"):
-            situation_parts.append(f"Последнее сообщение Владимира (резюме): {payload['last_vladimir_message_summary']}")
-        if payload.get("silence_days"):
-            situation_parts.append(f"Клиент молчал {payload['silence_days']} дней.")
-        if payload.get("deal_stage"):
-            situation_parts.append(f"Стадия сделки: {payload['deal_stage']}.")
-        if payload.get("client_situation_hint"):
-            situation_parts.append(f"Подсказка по ситуации: {payload['client_situation_hint']}.")
-
-        user_content = (
-            "\n".join(situation_parts)
-            + f"\n\nКанал: {channel}. Длина ответа: {length_note}. {price_note}"
-            + "\n\nНапиши черновик ответа Владимира. Только текст ответа, без заголовков и пояснений."
-        )
-
-        system_prompt = (
-            "Ты помогаешь Владимиру — агенту по недвижимости в Пхукете — писать ответы клиентам. "
-            "Используй стиль и паттерны из пака ниже: структуру, тон, типичные CTA. "
-            "Не копируй фразы дословно — повторяй структуру и тон. "
-            "Пиши только текст черновика ответа, без заголовков и пояснений.\n\n"
-            + pack_text
-        )
-        resp = await aclient.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=300,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception as exc:
-        import traceback as _tb
-        log.warning("style_draft: OpenAI API error: %s — %s", type(exc).__name__, _tb.format_exc()[-800:])
-        return ""
+    return await asyncio.to_thread(_call)
 
 
 @app.get("/style-runtime/v1/draft-health")
 async def style_draft_health(authorization: Optional[str] = Header(default=None)):
-    """Diagnostic: test OpenAI API connectivity from Render."""
+    """Diagnostic: ping Mac draft server at STYLE_RUNTIME_HTTP_BASE_URL/v1/draft."""
     check_office_write(authorization)
-    if not OPENAI_API_KEY:
-        return {"ok": False, "error": "OPENAI_API_KEY not set"}
-    try:
-        import openai as _openai
-        aclient = _openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-        resp = await aclient.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=10,
-            messages=[{"role": "user", "content": "ping"}],
-        )
-        return {"ok": True, "text": (resp.choices[0].message.content or "").strip(), "model": "gpt-4o-mini"}
-    except Exception as exc:
-        import traceback as _tb
-        return {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:500], "traceback": _tb.format_exc()[-600:]}
+    http_base = (STYLE_RUNTIME_HTTP_BASE_URL or "").rstrip("/")
+    http_token = STYLE_RUNTIME_HTTP_TOKEN or ""
+    if not http_base:
+        return {"ok": False, "error": "STYLE_RUNTIME_HTTP_BASE_URL not set"}
+
+    import urllib.request as _req, urllib.error as _uerr
+
+    def _ping() -> dict:
+        body = json.dumps({"pack_id": "client_asks_question", "payload": {
+            "channel": "whatsapp", "deal_stage": "selection",
+            "client_last_message_type": "question",
+            "last_client_message_summary": "Клиент спрашивает об объекте.",
+            "facts_available": [],
+        }}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if http_token:
+            headers["X-Style-Token"] = http_token
+        req = _req.Request(f"{http_base}/v1/draft", data=body, headers=headers, method="POST")
+        try:
+            with _req.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read())
+        except _uerr.HTTPError as e:
+            return {"ok": False, "error": f"HTTP {e.code}", "detail": e.read().decode("utf-8", errors="replace")[:300]}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:300]}
+
+    result = await asyncio.to_thread(_ping)
+    return result
 
 
 @app.post("/style-runtime/v1/draft")

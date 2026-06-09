@@ -5,15 +5,17 @@ Serves only from STYLE_RUNTIME_PUBLIC_DIR (~/.hermes/style-runtime-public/).
 No directory listing. Binds to 127.0.0.1 only — exposed publicly via ngrok/Cloudflare Tunnel.
 
 Allowed paths:
-  GET /health
-  GET /v1/latest/manifest.json
-  GET /v1/latest/style-runtime-index-v1.json
-  GET /v1/latest/packs/<pack_id>.md
+  GET  /health
+  GET  /v1/latest/manifest.json
+  GET  /v1/latest/style-runtime-index-v1.json
+  GET  /v1/latest/packs/<pack_id>.md
+  POST /v1/draft   — generate draft via OpenAI (uses OPENAI_API_KEY)
 
 Env:
   STYLE_RUNTIME_PUBLIC_DIR   default: ~/.hermes/style-runtime-public
   STYLE_RUNTIME_HTTP_PORT    default: 8901
   STYLE_RUNTIME_READ_TOKEN   optional; if set, X-Style-Token header must match
+  OPENAI_API_KEY             required for POST /v1/draft
 """
 from __future__ import annotations
 
@@ -24,6 +26,8 @@ import mimetypes
 import os
 import re
 import socketserver
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -32,10 +36,12 @@ log = logging.getLogger("style_runtime_server")
 PUBLIC_DIR = Path(os.environ.get("STYLE_RUNTIME_PUBLIC_DIR", "~/.hermes/style-runtime-public")).expanduser().resolve()
 PORT = int(os.environ.get("STYLE_RUNTIME_HTTP_PORT", "8901"))
 READ_TOKEN = os.environ.get("STYLE_RUNTIME_READ_TOKEN", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
-ALLOWED_PATH_RE = re.compile(
+ALLOWED_GET_RE = re.compile(
     r"^(/health|/v1/latest/manifest\.json|/v1/latest/style-runtime-index-v1\.json|/v1/latest/packs/[A-Za-z0-9_.-]+\.md)$"
 )
+PACK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
@@ -68,7 +74,7 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
 
-        if not ALLOWED_PATH_RE.match(path):
+        if not ALLOWED_GET_RE.match(path):
             self._send_json(404, {"error": "not found"})
             return
 
@@ -81,7 +87,6 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
             return
 
         file_path = PUBLIC_DIR / path.lstrip("/")
-        # Prevent path traversal: resolved path must stay within PUBLIC_DIR
         try:
             resolved = file_path.resolve()
             resolved.relative_to(PUBLIC_DIR)
@@ -104,6 +109,117 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self.do_GET()
 
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+
+        if path != "/v1/draft":
+            self._send_json(404, {"error": "not found"})
+            return
+
+        if not self._check_token():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > 32_768:
+            self._send_json(400, {"error": "payload too large"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length))
+        except Exception:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+
+        pack_id = body.get("pack_id", "")
+        if not PACK_ID_RE.match(pack_id):
+            self._send_json(400, {"error": "invalid pack_id"})
+            return
+
+        payload = body.get("payload") or {}
+        result = self._generate_draft(pack_id, payload)
+        self._send_json(200, result)
+
+    def _generate_draft(self, pack_id: str, payload: dict) -> dict:
+        if not OPENAI_API_KEY:
+            return {"ok": False, "error": "OPENAI_API_KEY not set on Mac server"}
+
+        pack_path = PUBLIC_DIR / "v1" / "latest" / "packs" / f"{pack_id}.md"
+        if not pack_path.is_file():
+            return {"ok": False, "error": f"pack not found: {pack_id}"}
+
+        try:
+            pack_text = pack_path.read_text(encoding="utf-8")
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+
+        channel = (payload.get("channel") or "app").lower()
+        is_messenger = channel in ("whatsapp", "telegram")
+        facts = payload.get("facts_available") or []
+        has_price_source = "price_source_ref" in facts
+        length_note = "1–3 предложения" if is_messenger else "3–5 предложений"
+        price_note = (
+            "Конкретные цены, проценты, доходность — НЕ упоминать: нет подтверждённого источника."
+            if not has_price_source
+            else "Конкретные цифры — только из подтверждённого источника, без выдумок."
+        )
+
+        parts = []
+        if payload.get("last_client_message_summary"):
+            parts.append(f"Последнее сообщение клиента: {payload['last_client_message_summary']}")
+        if payload.get("last_vladimir_message_summary"):
+            parts.append(f"Последнее сообщение Владимира: {payload['last_vladimir_message_summary']}")
+        if payload.get("silence_days"):
+            parts.append(f"Клиент молчал {payload['silence_days']} дней.")
+        if payload.get("deal_stage"):
+            parts.append(f"Стадия: {payload['deal_stage']}.")
+        if payload.get("client_situation_hint"):
+            parts.append(f"Подсказка: {payload['client_situation_hint']}.")
+
+        user_content = (
+            "\n".join(parts)
+            + f"\n\nКанал: {channel}. Длина: {length_note}. {price_note}"
+            + "\n\nНапиши черновик ответа Владимира. Только текст, без заголовков и пояснений."
+        )
+        system_prompt = (
+            "Ты помогаешь Владимиру — агенту по недвижимости в Пхукете — писать ответы клиентам. "
+            "Используй стиль и паттерны из пака ниже: структуру, тон, типичные CTA. "
+            "Не копируй фразы дословно — повторяй структуру и тон. "
+            "Пиши только текст черновика ответа, без заголовков и пояснений.\n\n"
+            + pack_text
+        )
+
+        api_body = json.dumps({
+            "model": "gpt-4o-mini",
+            "max_tokens": 300,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=api_body,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+                text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+                log.info("style_draft: generated %d chars for pack %s", len(text), pack_id)
+                return {"ok": True, "draft_text": text}
+        except urllib.error.HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")[:300]
+            log.warning("style_draft: OpenAI HTTP %d: %s", e.code, err)
+            return {"ok": False, "error": f"OpenAI HTTP {e.code}: {err}"}
+        except Exception as e:
+            log.warning("style_draft: OpenAI error: %s", e)
+            return {"ok": False, "error": str(e)[:300]}
+
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
@@ -117,6 +233,10 @@ def main() -> None:
         log.info("token auth: enabled (X-Style-Token required)")
     else:
         log.info("token auth: disabled")
+    if OPENAI_API_KEY:
+        log.info("OpenAI draft generation: enabled (gpt-4o-mini)")
+    else:
+        log.warning("OpenAI draft generation: OPENAI_API_KEY not set — POST /v1/draft will fail")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
