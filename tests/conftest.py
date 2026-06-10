@@ -43,6 +43,7 @@ def _set_test_env(tmp_path: Path) -> None:
     os.environ["FEEDBACK_FILE"] = str(tmp_path / "feedback.jsonl")
     os.environ["OFFICE_DRAFTS_FILE"] = str(tmp_path / "office_drafts.json")
     os.environ["DRAFT_FEEDBACK_LOG"] = str(tmp_path / "draft_feedback_log.jsonl")
+    os.environ["STYLE_RUNTIME_FEEDBACK_FILE"] = str(tmp_path / "style_runtime_feedback.jsonl")
 
 
 @pytest.fixture

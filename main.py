@@ -84,6 +84,10 @@ STYLE_RUNTIME_R2_SECRET_ACCESS_KEY = os.environ.get("STYLE_RUNTIME_R2_SECRET_ACC
 STYLE_RUNTIME_FEEDBACK_FILE = Path(os.environ.get("STYLE_RUNTIME_FEEDBACK_FILE", "/var/data/style_runtime_feedback.jsonl"))
 STYLE_RUNTIME_HTTP_BASE_URL = os.environ.get("STYLE_RUNTIME_HTTP_BASE_URL", "").strip().rstrip("/")
 STYLE_RUNTIME_HTTP_TOKEN = os.environ.get("STYLE_RUNTIME_HTTP_TOKEN", "").strip()
+STYLE_MEMORY_FILE = Path(os.environ.get(
+    "STYLE_MEMORY_FILE",
+    str(STYLE_RUNTIME_DIR / "style-memory-v1-approved-batch-a.jsonl"),
+))
 
 # APNs config (build 20). Файл .p8 либо лежит на диске (APNS_AUTH_KEY_FILE),
 # либо передаётся целиком через env (APNS_AUTH_KEY_CONTENT) — для Render.
@@ -2355,22 +2359,114 @@ _STYLE_USER_ACTIONS = {
     "approved", "edited_approved", "edited_and_approved", "rejected",
     "regenerated", "manual_reply_used",
 }
+_STYLE_DEAL_SITUATION_TYPES = {
+    "transferred", "new_lead", "active", "long_silence", "cold", "unknown",
+}
+_STYLE_CONTEXT_SOURCE_TYPES = ("call_transcripts", "voice_transcripts", "zoom_transcripts")
+_STYLE_RECENT_VOICE_CHANNELS = {"call", "voice", "zoom"}
+_STYLE_NOT_ACTUAL_MARKERS = (
+    "не актуально", "неактуально", "not_actual", "not actual", "не нужно",
+    "пока не", "не интересно", "отлож", "uncertain", "сомне",
+)
 
 
 def _style_text_has_pii(value) -> bool:
     text = str(value or "")
+    # Avoid false-positive on ISO dates in sanitized context snapshots.
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?\b", "", text)
     return any(p.search(text) for p in _PII_PATTERNS)
+
+
+def _assert_style_value_no_pii(value, field: str) -> None:
+    if isinstance(value, str):
+        if _style_text_has_pii(value):
+            raise HTTPException(status_code=400, detail=f"PII/raw data detected in {field}")
+    elif isinstance(value, list):
+        for item in value:
+            _assert_style_value_no_pii(item, field)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _assert_style_value_no_pii(item, field)
 
 
 def _assert_style_payload_no_pii(payload: dict, fields: tuple[str, ...]) -> None:
     for field in fields:
-        value = payload.get(field)
-        if isinstance(value, str) and _style_text_has_pii(value):
-            raise HTTPException(status_code=400, detail=f"PII/raw data detected in {field}")
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, str) and _style_text_has_pii(item):
-                    raise HTTPException(status_code=400, detail=f"PII/raw data detected in {field}")
+        _assert_style_value_no_pii(payload.get(field), field)
+
+
+def _style_meaning_says_not_actual(*values) -> bool:
+    text = " ".join(str(v or "") for v in values).lower()
+    return any(marker in text for marker in _STYLE_NOT_ACTUAL_MARKERS)
+
+
+def _style_normalize_source_coverage(snapshot: dict) -> dict:
+    raw = snapshot.get("source_coverage") if isinstance(snapshot, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+    normalized = {}
+    for source_type in _STYLE_CONTEXT_SOURCE_TYPES:
+        status = raw.get(source_type) or raw.get(source_type.replace("_transcripts", ""))
+        if isinstance(status, dict):
+            status = status.get("status")
+        normalized[source_type] = status or "not_present"
+    for key, value in raw.items():
+        normalized.setdefault(key, value.get("status") if isinstance(value, dict) else value)
+    return normalized
+
+
+def _style_context_missing_required(snapshot: dict) -> list[str]:
+    coverage = _style_normalize_source_coverage(snapshot)
+    return [source_type for source_type, status in coverage.items() if status == "missing_required"]
+
+
+def _style_build_deal_context_snapshot(payload: dict) -> dict:
+    """Build/normalize App Request Schema v1.1 deal_context_snapshot inline.
+
+    The backend remains stateless and does not read raw CRM/Obsidian text here.
+    Scheduler/app may pass sanitized signals; this adapter normalizes them so the
+    router/safety gate does not confuse a readable old timeline with a newer call.
+    """
+    existing = payload.get("deal_context_snapshot")
+    snapshot = dict(existing) if isinstance(existing, dict) else {}
+    last_contact = payload.get("last_significant_contact") or snapshot.get("last_vladimir_contact") or {}
+    if not isinstance(last_contact, dict):
+        last_contact = {}
+    snapshot.setdefault("last_vladimir_contact", last_contact)
+    snapshot.setdefault("dialogue_transferred", bool(payload.get("dialogue_transferred") or snapshot.get("dialogue_transferred")))
+    snapshot["source_coverage"] = _style_normalize_source_coverage(snapshot)
+    client_state_raw = snapshot.get("client_state")
+    client_state: dict = dict(client_state_raw) if isinstance(client_state_raw, dict) else {}
+    last_meaning = last_contact.get("meaning") if isinstance(last_contact, dict) else None
+    if not client_state.get("demand_status") and _style_meaning_says_not_actual(last_meaning, payload.get("last_client_message_summary")):
+        client_state["demand_status"] = "not_actual"
+    snapshot["client_state"] = client_state
+    missing_required = _style_context_missing_required(snapshot)
+    snapshot["context_status"] = "needs_context_review" if missing_required else snapshot.get("context_status", "ok")
+    return snapshot
+
+
+def _style_context_status(payload: dict) -> tuple[str, list[str], dict]:
+    snapshot = _style_build_deal_context_snapshot(payload)
+    missing_required = _style_context_missing_required(snapshot)
+    status = "needs_context_review" if missing_required else snapshot.get("context_status", "ok")
+    return status, missing_required, snapshot
+
+
+def _style_is_transferred_old_not_actual(payload: dict) -> bool:
+    snapshot = _style_build_deal_context_snapshot(payload)
+    if not (payload.get("dialogue_transferred") or snapshot.get("dialogue_transferred")):
+        return False
+    client_state_raw = snapshot.get("client_state")
+    client_state: dict = dict(client_state_raw) if isinstance(client_state_raw, dict) else {}
+    demand_status = str(client_state.get("demand_status") or "").lower()
+    if demand_status in {"not_actual", "uncertain"}:
+        return True
+    last_contact = payload.get("last_significant_contact") or snapshot.get("last_vladimir_contact") or {}
+    if isinstance(last_contact, dict):
+        channel = str(last_contact.get("channel") or "").lower()
+        if channel in _STYLE_RECENT_VOICE_CHANNELS and _style_meaning_says_not_actual(last_contact.get("meaning")):
+            return True
+    return False
 
 
 _STYLE_RUNTIME_R2_CACHE: Optional[dict] = None
@@ -2585,6 +2681,12 @@ def _style_load_runtime_pack(pack_id: str) -> dict:
 
 
 def _style_choose_pack(payload: dict) -> tuple[str, list[str], str]:
+    if _style_is_transferred_old_not_actual(payload):
+        return (
+            "transferred_old_dialogue_reactivation",
+            ["silence_reactivation"],
+            "Правило #0: переданная старая сделка + звонок/контакт с сигналом «не актуально», поэтому нужна мягкая проверка актуальности до любых silence-правил.",
+        )
     text = " ".join(str(payload.get(k) or "") for k in (
         "client_situation_hint", "last_client_message_summary", "deal_stage", "client_last_message_type",
     )).lower()
@@ -2601,12 +2703,143 @@ def _style_count_cta(text: str) -> int:
     return min(text.count("?") + sum(1 for marker in ("напишите", "скажи", "скажите", "удобно") if marker in text.lower()), 3)
 
 
-def _style_safety_gate(payload: dict, draft_text: str, pack_id: str) -> dict:
+_STYLE_MEMORY_EXAMPLE_TYPES = {"phrase_pattern", "full_structure", "start", "cta", "tone", "micro_pattern"}
+
+
+def _style_memory_list_contains(values, needle: str) -> bool:
+    if not needle:
+        return True
+    if not values:
+        return True
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return True
+    normalized = {str(item).strip().lower() for item in values if str(item).strip()}
+    if not normalized or normalized.intersection({"any", "all", "*"}):
+        return True
+    return needle.strip().lower() in normalized
+
+
+def _style_load_approved_memory_records() -> list[dict]:
+    path = STYLE_MEMORY_FILE
+    if not path.exists() and path.name == "style-memory-v1-approved-batch-a.jsonl":
+        path = STYLE_RUNTIME_DIR / "style-memory-v1.jsonl"
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                continue
+            if record.get("confidence") != "approved":
+                continue
+            if not record.get("id") or not record.get("text"):
+                continue
+            records.append(record)
+    except Exception:
+        log.warning("style_memory: failed to parse approved memory at %s", path, exc_info=True)
+        return []
+    return records
+
+
+def _style_select_memory_records(payload: dict, pack_id: str, limit: int = 8) -> dict:
+    channel = str(payload.get("channel") or "").lower()
+    stage = str(payload.get("deal_stage") or payload.get("client_last_message_type") or "").lower()
+    examples: list[dict] = []
+    guards: list[dict] = []
+    for record in _style_load_approved_memory_records():
+        record_pack = record.get("pack_id") or record.get("bucket")
+        if record_pack and record_pack != pack_id:
+            continue
+        if not _style_memory_list_contains(record.get("channel"), channel):
+            continue
+        if not _style_memory_list_contains(record.get("stage"), stage):
+            continue
+        record_type = str(record.get("type") or "").strip()
+        if record_type == "contraindication":
+            guards.append(record)
+        elif record_type in _STYLE_MEMORY_EXAMPLE_TYPES:
+            examples.append(record)
+    return {"examples": examples[:limit], "guards": guards[:limit]}
+
+
+def _style_format_memory_for_prompt(memory: dict) -> str:
+    sections = []
+    examples = memory.get("examples") or []
+    guards = memory.get("guards") or []
+    if examples:
+        lines = ["STYLE MEMORY EXAMPLES (approved only; use as style/tone/structure hints, not as CRM facts):"]
+        for item in examples:
+            lines.append(f"- {item.get('id')} [{item.get('type')}]: {item.get('text')}")
+        sections.append("\n".join(lines))
+    if guards:
+        lines = ["STYLE MEMORY GUARDS (approved contraindications; do NOT use as positive/example phrases):"]
+        for item in guards:
+            lines.append(f"- {item.get('id')}: {item.get('text')}")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
+
+
+def _style_quoted_fragments(text: str) -> list[str]:
+    fragments = []
+    for left, right in (("«", "»"), ('"', '"'), ("'", "'")):
+        pattern = re.escape(left) + r"([^" + re.escape(right) + r"]{3,})" + re.escape(right)
+        fragments.extend(match.strip() for match in re.findall(pattern, text or "") if match.strip())
+    return fragments
+
+
+def _style_memory_guard_flags(draft_text: str, memory: dict) -> list[str]:
+    if not draft_text:
+        return []
+    draft_lower = draft_text.lower()
+    for guard in memory.get("guards") or []:
+        fragments = _style_quoted_fragments(str(guard.get("text") or ""))
+        if any(fragment.lower() in draft_lower for fragment in fragments):
+            return ["style_memory_contraindication"]
+    return []
+
+
+def _style_client_text_forbidden_flags(draft_text: str) -> list[str]:
+    """Hard style boundary for client-facing drafts.
+
+    These are not model preferences. Vladimir explicitly treats em dashes and
+    internal meta-formulas like "без давления" as AI tells in messages to clients.
+    If the writer emits them, the draft must be routed to manual review instead
+    of being shown as a ready-to-send message.
+    """
+    text = draft_text or ""
+    lower = text.lower()
+    flags = []
+    if "—" in text or "–" in text:
+        flags.append("ai_dash_detected")
+    if any(marker in lower for marker in (
+        "без давления",
+        "без подборок",
+        "без подборок и давления",
+        "не буду давить",
+        "не хочу давить",
+    )):
+        flags.append("internal_style_meta_phrase")
+    return flags
+
+
+def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memory: Optional[dict] = None) -> dict:
     facts = set(payload.get("facts_available") or [])
     summary = " ".join(str(payload.get(k) or "") for k in ("client_situation_hint", "last_client_message_summary")).lower()
     flags = []
     missing = []
     risk = "low"
+
+    context_status, missing_sources, snapshot = _style_context_status(payload)
+    if context_status == "needs_context_review":
+        risk = "high"
+        flags.append("missing_call_context")
+        missing.extend(missing_sources)
 
     price_intent = pack_id == "price_roi_explanation" or any(k in summary for k in ("цена", "price", "roi", "доход", "окуп", "рассроч"))
     if price_intent:
@@ -2619,9 +2852,42 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str) -> dict:
     cta_count = _style_count_cta(draft_text)
     if cta_count > 1:
         flags.append("too_many_cta")
+    flags.extend(_style_client_text_forbidden_flags(draft_text))
+    flags.extend(_style_memory_guard_flags(draft_text, style_memory or {}))
     if _style_text_has_pii(draft_text):
         flags.append("pii_detected")
-    safety_pass = not any(f in flags for f in ("price_without_source", "pii_detected", "too_many_cta"))
+
+    if payload.get("dialogue_transferred") or snapshot.get("dialogue_transferred"):
+        draft_lower = (draft_text or "").lower()
+        if any(marker in draft_lower for marker in ("я отправлял", "я отправил", "я присылал", "как я писал", "как я говорил")):
+            flags.append("author_confusion")
+        if any(marker in draft_lower for marker in ("продолжим подбор", "продолжаем подбор", "дальше по подборке", "смотрим дальше")):
+            flags.append("unsupported_continuity_claim")
+        client_state = snapshot.get("client_state") if isinstance(snapshot.get("client_state"), dict) else {}
+        demand_status = str((client_state or {}).get("demand_status") or "").lower()
+        if demand_status in {"not_actual", "uncertain"} and "актуаль" not in draft_lower:
+            flags.append("not_actual_client_ignored")
+        last_contact = snapshot.get("last_vladimir_contact") if isinstance(snapshot.get("last_vladimir_contact"), dict) else {}
+        channel = str((last_contact or {}).get("channel") or "").lower()
+        if channel in _STYLE_RECENT_VOICE_CHANNELS and payload.get("last_vladimir_message_summary") and "актуаль" not in draft_lower:
+            flags.append("stale_timeline_overrides_recent_call")
+
+    hard_block_flags = {
+        "price_without_source", "pii_detected", "too_many_cta", "missing_call_context",
+        "author_confusion", "unsupported_continuity_claim", "not_actual_client_ignored",
+        "ai_dash_detected", "internal_style_meta_phrase", "style_memory_contraindication",
+    }
+    flags = list(dict.fromkeys(flags))
+    missing = list(dict.fromkeys(missing))
+    safety_pass = not any(f in flags for f in hard_block_flags)
+    if "missing_call_context" in flags:
+        block_reason = "Контекст неполный: есть обязательный источник звонка/voice/Zoom, который не прочитан. Показываем предупреждение вместо черновика."
+    elif "ai_dash_detected" in flags or "internal_style_meta_phrase" in flags:
+        block_reason = "Черновик похож на AI-текст или содержит внутреннюю формулировку. Нужна ручная правка вместо показа как готового сообщения."
+    elif "style_memory_contraindication" in flags:
+        block_reason = "Черновик нарушает approved Style Memory contraindication. Нужна ручная правка вместо показа как готового сообщения."
+    else:
+        block_reason = None if safety_pass else "Нельзя показывать как готовый черновик: не хватает подтверждённых фактов или есть safety-флаг."
     return {
         "pass": safety_pass,
         "risk_level": risk,
@@ -2629,7 +2895,8 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str) -> dict:
         "missing_facts": missing,
         "cta_count": 0 if not safety_pass else cta_count,
         "show_to_vladimir": True,
-        "block_reason": None if safety_pass else "Нельзя показывать как готовый черновик: не хватает подтверждённых фактов или есть safety-флаг.",
+        "block_reason": block_reason,
+        "context_status": context_status,
     }
 
 
@@ -2650,7 +2917,14 @@ async def _style_write_draft(payload: dict, pack_id: str, pack_text: str = "") -
     import urllib.request as _req, urllib.error as _uerr
 
     def _call() -> str:
-        body = json.dumps({"pack_id": pack_id, "payload": payload}).encode("utf-8")
+        request_body = {"pack_id": pack_id, "payload": payload}
+        if pack_text:
+            # Audit blocker fix: the backend has already merged the selected
+            # runtime pack with approved-only Style Memory. Send that exact
+            # merged text to the Mac/Ollama writer so the real HTTP path uses
+            # the same prompt context that the safety/debug fields report.
+            request_body["pack_text"] = pack_text
+        body = json.dumps(request_body).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if http_token:
             headers["X-Style-Token"] = http_token
@@ -2714,6 +2988,11 @@ async def style_runtime_draft(
     authorization: Optional[str] = Header(default=None),
 ):
     check_office_write(authorization)
+    payload = dict(payload)
+    payload["deal_context_snapshot"] = _style_build_deal_context_snapshot(payload)
+    payload.setdefault("dialogue_transferred", bool(payload["deal_context_snapshot"].get("dialogue_transferred")))
+    if "last_significant_contact" not in payload and payload["deal_context_snapshot"].get("last_vladimir_contact"):
+        payload["last_significant_contact"] = payload["deal_context_snapshot"].get("last_vladimir_contact")
     required = (
         "request_id", "deal_ref", "channel", "deal_stage", "client_last_message_type", "requested_output",
     )
@@ -2723,19 +3002,24 @@ async def style_runtime_draft(
     if payload.get("requested_output") != "client_reply_draft":
         raise HTTPException(status_code=400, detail="requested_output must be client_reply_draft")
     _assert_style_payload_no_pii(payload, (
-        "deal_ref", "client_situation_hint", "last_client_message_summary", "last_vladimir_message_summary", "facts_available",
+        "deal_ref", "client_situation_hint", "last_client_message_summary", "last_vladimir_message_summary",
+        "last_significant_contact", "deal_context_snapshot", "facts_available",
     ))
 
     pack_id, secondary_pack_ids, router_reason = _style_choose_pack(payload)
     runtime_state = _style_load_runtime_pack(pack_id)
+    style_memory = _style_select_memory_records(payload, pack_id)
     runtime_index = runtime_state.get("index") or {}
     if runtime_index and not _style_pack_in_index(runtime_index, pack_id):
         log.warning("style_runtime: selected pack %s absent from runtime index", pack_id)
 
     pack_text = runtime_state.get("pack_text") or ""
+    memory_text = _style_format_memory_for_prompt(style_memory)
+    if memory_text:
+        pack_text = f"{pack_text}\n\n{memory_text}" if pack_text else memory_text
     draft_text = await _style_write_draft(payload, pack_id, pack_text=pack_text)
-    draft_api_failed = bool(pack_text) and not draft_text
-    safety = _style_safety_gate(payload, draft_text, pack_id)
+    draft_api_failed = bool(runtime_state.get("pack_text")) and not draft_text
+    safety = _style_safety_gate(payload, draft_text, pack_id, style_memory=style_memory)
     runtime_block_reason = runtime_state.get("block_reason")
     if STYLE_RUNTIME_SOURCE in ("r2", "http") and not runtime_state.get("ok"):
         safety["pass"] = False
@@ -2768,6 +3052,13 @@ async def style_runtime_draft(
         "runtime_pack_sha256": runtime_state.get("pack_sha256"),
         "runtime_snapshot_version": runtime_state.get("snapshot_version"),
         "runtime_block_reason": runtime_block_reason,
+        "style_memory_loaded": bool((style_memory.get("examples") or []) or (style_memory.get("guards") or [])),
+        "style_memory_example_ids": [item.get("id") for item in style_memory.get("examples", [])],
+        "style_memory_guard_ids": [item.get("id") for item in style_memory.get("guards", [])],
+        "context_status": safety.get("context_status", "ok"),
+        "deal_context_snapshot": payload.get("deal_context_snapshot"),
+        "last_significant_contact": payload.get("last_significant_contact"),
+        "dialogue_transferred": bool(payload.get("dialogue_transferred")),
         "show_to_vladimir": safety["show_to_vladimir"],
         "block_reason": safety["block_reason"],
         "send_performed": False,
@@ -2791,6 +3082,9 @@ async def style_runtime_feedback(
     user_action = payload.get("user_action")
     if user_action not in _STYLE_USER_ACTIONS:
         raise HTTPException(status_code=400, detail="unknown user_action")
+    deal_situation_type = payload.get("deal_situation_type") or "unknown"
+    if deal_situation_type not in _STYLE_DEAL_SITUATION_TYPES:
+        raise HTTPException(status_code=400, detail="unknown deal_situation_type")
     _assert_style_payload_no_pii(payload, (
         "deal_ref", "message_context_ref", "selected_pack_id", "draft_id", "feedback_text_sanitized",
     ))
@@ -2805,6 +3099,7 @@ async def style_runtime_feedback(
         "message_context_ref": payload.get("message_context_ref"),
         "selected_pack_id": payload["selected_pack_id"],
         "secondary_pack_ids": payload.get("secondary_pack_ids") or [],
+        "deal_situation_type": deal_situation_type,
         "draft_id": payload["draft_id"],
         "draft_version": payload.get("draft_version") or 1,
         "feedback_type": feedback_type,
@@ -2962,26 +3257,37 @@ async def _auto_draft_on_client_reply(task: dict, preview: str) -> None:
         else:
             deal_stage = "unknown"
 
-        # Build style-runtime payload (sanitized — no PII)
+        # Build style-runtime payload (sanitized — no PII). App Request Schema v1.1
+        # fields are optional/backward-compatible but passed through when scheduler
+        # already supplied sanitized context signals.
         style_payload = {
             "request_id": f"auto-{task_id}-{int(datetime.now(timezone.utc).timestamp())}",
             "deal_ref": f"task_{task_id}",
             "channel": channel,
             "last_client_message_summary": (preview or "Клиент написал сообщение.")[:300],
             "last_vladimir_message_summary": ((task.get("suggested_message") or "")[:200]) or None,
+            "last_significant_contact": task.get("last_significant_contact"),
+            "dialogue_transferred": bool(task.get("dialogue_transferred")),
+            "deal_context_snapshot": task.get("deal_context_snapshot") or {},
             "silence_days": task.get("silence_days"),
             "deal_stage": deal_stage,
             "client_last_message_type": "question",
             "facts_available": [],
             "requested_output": "client_reply_draft",
         }
+        style_payload["deal_context_snapshot"] = _style_build_deal_context_snapshot(style_payload)
+        style_payload["dialogue_transferred"] = bool(style_payload["deal_context_snapshot"].get("dialogue_transferred"))
 
         pack_id, secondary_pack_ids, router_reason = _style_choose_pack(style_payload)
         runtime_state = _style_load_runtime_pack(pack_id)
+        style_memory = _style_select_memory_records(style_payload, pack_id)
         pack_text = runtime_state.get("pack_text") or ""
+        memory_text = _style_format_memory_for_prompt(style_memory)
+        if memory_text:
+            pack_text = f"{pack_text}\n\n{memory_text}" if pack_text else memory_text
         draft_text = await _style_write_draft(style_payload, pack_id, pack_text=pack_text)
-        draft_api_failed = bool(pack_text) and not draft_text
-        safety = _style_safety_gate(style_payload, draft_text, pack_id)
+        draft_api_failed = bool(runtime_state.get("pack_text")) and not draft_text
+        safety = _style_safety_gate(style_payload, draft_text, pack_id, style_memory=style_memory)
 
         if draft_api_failed and not draft_text:
             safety["pass"] = False
@@ -2997,10 +3303,11 @@ async def _auto_draft_on_client_reply(task: dict, preview: str) -> None:
         draft_id = f"style-auto-{task_id}-{_uuid.uuid4().hex[:8]}"
         expires_at = (datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)).isoformat()
 
+        visible_draft_text = draft_text if safety["pass"] else f"[Черновик заблокирован: {safety.get('block_reason', '')}]"
         draft_payload = {
             "draft_id": draft_id,
             "entity_id": str(lead_id or task_id),
-            "text": draft_text or f"[Черновик заблокирован: {safety.get('block_reason', '')}]",
+            "text": visible_draft_text,
             "category": "style_runtime",
             "created_by_role": "style_engine",
             "expires_at": expires_at,
@@ -3010,6 +3317,9 @@ async def _auto_draft_on_client_reply(task: dict, preview: str) -> None:
             "missing_facts": safety.get("missing_facts", []),
             "safety_flags": safety.get("flags", []),
             "block_reason": safety.get("block_reason"),
+            "context_status": safety.get("context_status", "ok"),
+            "deal_context_snapshot": style_payload.get("deal_context_snapshot"),
+            "dialogue_transferred": bool(style_payload.get("dialogue_transferred")),
         }
 
         async with _office_drafts_lock:
@@ -3040,7 +3350,7 @@ async def _auto_draft_on_client_reply(task: dict, preview: str) -> None:
 
         push_count = await send_push_to_all(
             title="Черновик ответа",
-            body=(draft_text or "")[:80],
+            body=visible_draft_text[:80],
             payload={"kind": "draft_ready", "draft_id": draft_id, "entity_id": str(lead_id or task_id)},
         )
         async with _office_drafts_lock:
@@ -3064,6 +3374,7 @@ _DRAFT_TERMINAL_STATUSES = {
 
 _STYLE_DRAFT_CONTEXT_FIELDS = (
     "pack_id", "risk_level", "missing_facts", "safety_flags", "block_reason", "manual_review_only",
+    "context_status", "deal_context_snapshot", "dialogue_transferred",
 )
 
 _CLAIM_TTL_SECONDS = 600  # 10 minutes

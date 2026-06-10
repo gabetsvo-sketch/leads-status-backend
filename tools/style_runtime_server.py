@@ -122,7 +122,7 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
             return
 
         length = int(self.headers.get("Content-Length", "0"))
-        if length > 32_768:
+        if length > 262_144:
             self._send_json(400, {"error": "payload too large"})
             return
         try:
@@ -137,18 +137,53 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
             return
 
         payload = body.get("payload") or {}
-        result = self._generate_draft(pack_id, payload)
+        provided_pack_text = body.get("pack_text")
+        result = self._generate_draft(pack_id, payload, provided_pack_text=provided_pack_text)
         self._send_json(200, result)
 
-    def _generate_draft(self, pack_id: str, payload: dict) -> dict:
-        pack_path = PUBLIC_DIR / "v1" / "latest" / "packs" / f"{pack_id}.md"
-        if not pack_path.is_file():
-            return {"ok": False, "error": f"pack not found: {pack_id}"}
+    @staticmethod
+    def _extract_style_memory_ids(pack_text: str) -> dict:
+        example_ids = []
+        guard_ids = []
+        in_examples = False
+        in_guards = False
+        for line in (pack_text or "").splitlines():
+            stripped = line.strip()
+            upper = stripped.upper()
+            if upper.startswith("STYLE MEMORY EXAMPLES"):
+                in_examples = True
+                in_guards = False
+                continue
+            if upper.startswith("STYLE MEMORY GUARDS"):
+                in_examples = False
+                in_guards = True
+                continue
+            match = re.match(r"^-\s+([A-Za-z0-9_.:-]+)", stripped)
+            if not match:
+                continue
+            if in_examples:
+                example_ids.append(match.group(1))
+            elif in_guards:
+                guard_ids.append(match.group(1))
+        return {"style_memory_example_ids": example_ids, "style_memory_guard_ids": guard_ids}
 
-        try:
-            pack_text = pack_path.read_text(encoding="utf-8")
-        except OSError as e:
-            return {"ok": False, "error": str(e)}
+    def _generate_draft(self, pack_id: str, payload: dict, provided_pack_text=None) -> dict:
+        pack_text_source = "disk"
+        if provided_pack_text is not None:
+            if not isinstance(provided_pack_text, str) or not provided_pack_text.strip():
+                return {"ok": False, "error": "invalid pack_text"}
+            pack_text = provided_pack_text
+            pack_text_source = "request"
+        else:
+            pack_path = PUBLIC_DIR / "v1" / "latest" / "packs" / f"{pack_id}.md"
+            if not pack_path.is_file():
+                return {"ok": False, "error": f"pack not found: {pack_id}"}
+
+            try:
+                pack_text = pack_path.read_text(encoding="utf-8")
+            except OSError as e:
+                return {"ok": False, "error": str(e)}
+        style_memory_debug = self._extract_style_memory_ids(pack_text)
 
         channel = (payload.get("channel") or "app").lower()
         is_messenger = channel in ("whatsapp", "telegram")
@@ -208,7 +243,12 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
                 data = json.loads(resp.read())
                 text = (data.get("message") or {}).get("content", "").strip()
                 log.info("style_draft: generated %d chars for pack %s via Ollama/%s", len(text), pack_id, OLLAMA_MODEL)
-                return {"ok": True, "draft_text": text}
+                return {
+                    "ok": True,
+                    "draft_text": text,
+                    "pack_text_source": pack_text_source,
+                    **style_memory_debug,
+                }
         except Exception as e:
             log.warning("style_draft: Ollama error: %s", e)
             return {"ok": False, "error": str(e)[:300]}

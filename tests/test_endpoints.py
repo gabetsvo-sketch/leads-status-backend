@@ -691,6 +691,32 @@ def test_structured_variants_keep_approve_claim_consume_dry_run_contract(app_cli
     assert consume.status_code == 200
     assert consume.json().get("status") == "dry_run_consumed"
 
+def test_office_draft_create_preserves_style_runtime_safety_fields(app_client, office_headers, widget_headers):
+    client, _ = app_client
+    r = client.post(
+        "/api/office/drafts",
+        headers=office_headers,
+        json=_draft(
+            "d-style-context",
+            pack_id="price_roi_explanation",
+            risk_level="high",
+            missing_facts=["price_source_ref"],
+            safety_flags=["price_without_source"],
+            block_reason="Нельзя подставлять цену без источника.",
+            manual_review_only=True,
+        ),
+    )
+    assert r.status_code == 200, r.text
+
+    draft = _get_draft(client, "d-style-context", widget_headers)
+    assert draft["pack_id"] == "price_roi_explanation"
+    assert draft["risk_level"] == "high"
+    assert draft["missing_facts"] == ["price_source_ref"]
+    assert draft["safety_flags"] == ["price_without_source"]
+    assert draft["block_reason"] == "Нельзя подставлять цену без источника."
+    assert draft["manual_review_only"] is True
+
+
 # ---------------------------------------------------------------------------
 # LS-TZ-MIKHAIL-1108 — Sakhalin timezone transport regression
 # ---------------------------------------------------------------------------
