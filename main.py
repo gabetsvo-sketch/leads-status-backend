@@ -2723,9 +2723,17 @@ def _style_memory_list_contains(values, needle: str) -> bool:
 
 def _style_load_approved_memory_records() -> list[dict]:
     path = STYLE_MEMORY_FILE
-    if not path.exists() and path.name == "style-memory-v1-approved-batch-a.jsonl":
-        path = STYLE_RUNTIME_DIR / "style-memory-v1.jsonl"
-    if not path.exists():
+    candidate_paths = [path]
+    if path.name == "style-memory-v1-approved-batch-a.jsonl":
+        candidate_paths.extend([
+            STYLE_RUNTIME_DIR / "style-memory-v1.jsonl",
+            Path(__file__).resolve().with_name("style-memory-v1-approved-batch-a.jsonl"),
+        ])
+    for candidate in candidate_paths:
+        if candidate.exists():
+            path = candidate
+            break
+    else:
         return []
     records: list[dict] = []
     try:
