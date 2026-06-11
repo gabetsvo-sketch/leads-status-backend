@@ -2684,7 +2684,7 @@ def _style_choose_pack(payload: dict) -> tuple[str, list[str], str]:
     if _style_is_transferred_old_not_actual(payload):
         return (
             "transferred_old_dialogue_reactivation",
-            ["silence_reactivation"],
+            ["long_silence_reactivation"],
             "Правило #0: переданная старая сделка + звонок/контакт с сигналом «не актуально», поэтому нужна мягкая проверка актуальности до любых silence-правил.",
         )
     text = " ".join(str(payload.get(k) or "") for k in (
@@ -2693,7 +2693,15 @@ def _style_choose_pack(payload: dict) -> tuple[str, list[str], str]:
     if any(k in text for k in ("цена", "price", "roi", "доход", "окуп", "рассроч", "payment")):
         return "price_roi_explanation", ["client_asks_question"], "Запрос связан с ценой/деньгами, поэтому выбран денежный pack с жёстким safety gate."
     if payload.get("silence_days") not in (None, "", 0) or "silence" in text or "молч" in text:
-        return "silence_reactivation", [], "Сценарий похож на реактивацию после паузы."
+        try:
+            silence_days = float(payload.get("silence_days") or 0)
+        except (TypeError, ValueError):
+            silence_days = 0.0
+        # Паки runtime-снапшота: followup_after_silence (короткая пауза 3-10 дней)
+        # и long_silence_reactivation (14+ дней). Пака "silence_reactivation" не существует.
+        if silence_days >= 14:
+            return "long_silence_reactivation", ["followup_after_silence"], "Долгая пауза (14+ дней): реактивация."
+        return "followup_after_silence", ["long_silence_reactivation"], "Пауза после диалога: мягкий follow-up."
     return "client_asks_question", [], "Клиент задаёт обычный вопрос/просит следующий шаг."
 
 

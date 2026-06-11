@@ -217,6 +217,8 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
             "Ты помогаешь Владимиру — агенту по недвижимости в Пхукете — писать ответы клиентам. "
             "Используй стиль и паттерны из пака ниже: структуру, тон, типичные CTA. "
             "Не копируй фразы дословно — повторяй структуру и тон. "
+            "Пиши только по-русски. Никогда не используй длинное тире (—) и среднее тире (–): "
+            "только запятая, точка или короткий дефис. "
             "Пиши только текст черновика ответа, без заголовков и пояснений.\n\n"
             + pack_text
         )
@@ -238,20 +240,34 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read())
-                text = (data.get("message") or {}).get("content", "").strip()
-                log.info("style_draft: generated %d chars for pack %s via Ollama/%s", len(text), pack_id, OLLAMA_MODEL)
-                return {
-                    "ok": True,
-                    "draft_text": text,
-                    "pack_text_source": pack_text_source,
-                    **style_memory_debug,
-                }
-        except Exception as e:
-            log.warning("style_draft: Ollama error: %s", e)
-            return {"ok": False, "error": str(e)[:300]}
+        # До двух попыток: локальная модель изредка вставляет CJK-текст —
+        # такой черновик бракуем и генерируем заново (regenerate-before-block).
+        last_error = "empty draft"
+        for attempt in (1, 2):
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read())
+                    text = (data.get("message") or {}).get("content", "").strip()
+            except Exception as e:
+                log.warning("style_draft: Ollama error (attempt %d): %s", attempt, e)
+                last_error = str(e)[:300]
+                continue
+            if any("一" <= ch <= "鿿" for ch in text):
+                log.warning("style_draft: CJK glitch on attempt %d, retrying", attempt)
+                last_error = "CJK glitch in draft"
+                continue
+            # Жёсткое правило стиля Владимира: длинное/среднее тире — признак AI-текста.
+            text = text.replace(" — ", ", ").replace(" – ", ", ").replace("—", "-").replace("–", "-")
+            if not text:
+                continue
+            log.info("style_draft: generated %d chars for pack %s via Ollama/%s (attempt %d)", len(text), pack_id, OLLAMA_MODEL, attempt)
+            return {
+                "ok": True,
+                "draft_text": text,
+                "pack_text_source": pack_text_source,
+                **style_memory_debug,
+            }
+        return {"ok": False, "error": last_error}
 
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
