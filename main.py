@@ -2731,7 +2731,7 @@ def _style_choose_pack(payload: dict) -> tuple[str, list[str], str]:
     stage = str(payload.get("deal_stage") or "").lower()
 
     # Рискованные сценарии (деньги/юридика/оплата) — первыми: у них жёсткий safety gate.
-    if any(k in text for k in ("цена", "price", "roi", "доход", "окуп", "стоимост", "бюджет")):
+    if any(k in text for k in ("цена", "price", "roi", "доход", "стоимост", "бюджет")) or re.search(r"\bокуп", text):
         return "price_roi_explanation", ["client_asks_question"], "Запрос связан с ценой/деньгами, поэтому выбран денежный pack с жёстким safety gate."
     if any(k in text for k in ("юрид", "доверенност", "удаленн", "удалённ", "дистанцион", "freehold", "leasehold", "фрихолд", "лизхолд", "собственност")):
         return "legal_remote_purchase_explanation", ["client_asks_question"], "Юридическая схема/удалённая покупка: жёсткий запрет на гарантии без источника."
@@ -2917,7 +2917,7 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
         flags.append("missing_call_context")
         missing.extend(missing_sources)
 
-    price_intent = pack_id == "price_roi_explanation" or any(k in summary for k in ("цена", "price", "roi", "доход", "окуп", "рассроч"))
+    price_intent = pack_id == "price_roi_explanation" or any(k in summary for k in ("цена", "price", "roi", "доход", "рассроч")) or bool(re.search(r"\bокуп", summary))
     if price_intent:
         risk = "high"
         if "price_source_ref" not in facts:

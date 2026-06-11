@@ -76,3 +76,16 @@ def test_router_never_returns_unpublished_pack(app_client):
         pack_id, secondary, _ = main._style_choose_pack(dict(p))
         assert pack_id in PUBLISHED_PACKS
         assert all(s in PUBLISHED_PACKS for s in secondary)
+
+
+def test_pokupka_does_not_trigger_price_pack(app_client):
+    """Регрессия: «окуп» (окупаемость) ловил подстроку в «покупке/покупаем»."""
+    _, main = app_client
+    pack_id, _, _ = main._style_choose_pack(
+        {"last_client_message_summary": "Думаем о покупке квартиры, что посоветуете по районам?"}
+    )
+    assert pack_id != "price_roi_explanation"
+    pack_id, _, _ = main._style_choose_pack(
+        {"last_client_message_summary": "Какая окупаемость у этого проекта?"}
+    )
+    assert pack_id == "price_roi_explanation"
