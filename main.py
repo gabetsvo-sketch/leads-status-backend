@@ -2916,6 +2916,38 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
     }
 
 
+# Флаги, при которых имеет смысл перегенерировать черновик (дефект текста,
+# а не контекста). Spec: «Style Critic / regenerate-before-block».
+_STYLE_RETRYABLE_FLAGS = {
+    "too_many_cta", "ai_dash_detected", "internal_style_meta_phrase",
+    "not_actual_client_ignored", "stale_timeline_overrides_recent_call",
+    "author_confusion", "unsupported_continuity_claim",
+    "style_memory_contraindication", "pii_detected",
+}
+
+
+async def _style_generate_with_retries(
+    payload: dict, pack_id: str, pack_text: str, style_memory: dict, attempts: int = 3,
+) -> tuple[str, dict]:
+    """Generate draft, re-running the writer when the safety gate raises
+    text-level (retryable) flags. Context-level flags (missing facts/sources)
+    are not retried: the writer cannot fix them."""
+    draft_text = ""
+    safety: dict = {}
+    for attempt in range(1, attempts + 1):
+        draft_text = await _style_write_draft(payload, pack_id, pack_text=pack_text)
+        safety = _style_safety_gate(payload, draft_text, pack_id, style_memory=style_memory)
+        if safety["pass"] and draft_text:
+            return draft_text, safety
+        if not draft_text:
+            break  # writer down — retry won't help
+        flags = set(safety.get("flags") or [])
+        if not flags & _STYLE_RETRYABLE_FLAGS or flags - _STYLE_RETRYABLE_FLAGS:
+            break  # non-retryable (or mixed with non-retryable) — keep gate verdict
+        log.info("style_draft: retry %d/%d for pack %s after flags %s", attempt, attempts, pack_id, sorted(flags))
+    return draft_text, safety
+
+
 async def _style_write_draft(payload: dict, pack_id: str, pack_text: str = "") -> str:
     channel = (payload.get("channel") or "app").lower()
     is_messenger = channel in ("whatsapp", "telegram")
@@ -3033,9 +3065,8 @@ async def style_runtime_draft(
     memory_text = _style_format_memory_for_prompt(style_memory)
     if memory_text:
         pack_text = f"{pack_text}\n\n{memory_text}" if pack_text else memory_text
-    draft_text = await _style_write_draft(payload, pack_id, pack_text=pack_text)
+    draft_text, safety = await _style_generate_with_retries(payload, pack_id, pack_text, style_memory)
     draft_api_failed = bool(runtime_state.get("pack_text")) and not draft_text
-    safety = _style_safety_gate(payload, draft_text, pack_id, style_memory=style_memory)
     runtime_block_reason = runtime_state.get("block_reason")
     if STYLE_RUNTIME_SOURCE in ("r2", "http") and not runtime_state.get("ok"):
         safety["pass"] = False
@@ -3301,9 +3332,8 @@ async def _auto_draft_on_client_reply(task: dict, preview: str) -> None:
         memory_text = _style_format_memory_for_prompt(style_memory)
         if memory_text:
             pack_text = f"{pack_text}\n\n{memory_text}" if pack_text else memory_text
-        draft_text = await _style_write_draft(style_payload, pack_id, pack_text=pack_text)
+        draft_text, safety = await _style_generate_with_retries(style_payload, pack_id, pack_text, style_memory)
         draft_api_failed = bool(runtime_state.get("pack_text")) and not draft_text
-        safety = _style_safety_gate(style_payload, draft_text, pack_id, style_memory=style_memory)
 
         if draft_api_failed and not draft_text:
             safety["pass"] = False

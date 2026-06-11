@@ -207,6 +207,16 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
             parts.append(f"Стадия: {payload['deal_stage']}.")
         if payload.get("client_situation_hint"):
             parts.append(f"Подсказка: {payload['client_situation_hint']}.")
+        # Если клиент ранее сказал «не актуально» — safety gate требует, чтобы
+        # черновик явно проверял актуальность. Подсказываем модели заранее,
+        # чтобы черновик не был заблокирован постфактум.
+        snapshot = payload.get("deal_context_snapshot") or {}
+        demand = str(((snapshot.get("client_state") or {}).get("demand_status")) or "").lower()
+        if demand in ("not_actual", "uncertain") or payload.get("dialogue_transferred"):
+            parts.append(
+                "Клиент ранее говорил, что вопрос может быть не актуален. "
+                "Обязательно мягко уточни, актуален ли вопрос сейчас, и используй слово «актуально» или «актуален»."
+            )
 
         user_content = (
             "\n".join(parts)
