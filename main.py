@@ -2941,11 +2941,11 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
             flags.append("unsupported_continuity_claim")
         client_state = snapshot.get("client_state") if isinstance(snapshot.get("client_state"), dict) else {}
         demand_status = str((client_state or {}).get("demand_status") or "").lower()
-        if demand_status in {"not_actual", "uncertain"} and "актуаль" not in draft_lower:
+        if demand_status in {"not_actual", "uncertain"} and "актуал" not in draft_lower:
             flags.append("not_actual_client_ignored")
         last_contact = snapshot.get("last_vladimir_contact") if isinstance(snapshot.get("last_vladimir_contact"), dict) else {}
         channel = str((last_contact or {}).get("channel") or "").lower()
-        if channel in _STYLE_RECENT_VOICE_CHANNELS and payload.get("last_vladimir_message_summary") and "актуаль" not in draft_lower:
+        if channel in _STYLE_RECENT_VOICE_CHANNELS and payload.get("last_vladimir_message_summary") and "актуал" not in draft_lower:
             flags.append("stale_timeline_overrides_recent_call")
 
     hard_block_flags = {
