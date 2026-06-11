@@ -557,13 +557,51 @@ async def on_new_message(event):
 
 
 async def _generate_3min_message(lead: dict) -> str:
-    """Короткое системное сообщение для нового лида (Phase 2). Генерится Claude или fallback-template."""
+    """Короткое системное сообщение для нового лида (Phase 2).
+
+    Основной путь — движок стиля: пак initial_contact_after_lead + approved
+    Style Memory + safety gate. Fallback — прежний generic-промпт, затем шаблон.
+    """
     name_first = (lead.get("name") or "").split(maxsplit=1)[0] or ""
     if not ANTHROPIC_API_KEY:
         # Fallback без Claude
         if name_first:
             return f"{name_first}, здравствуйте! Это Владимир из агентства RealDream на Пхукете. Получил вашу заявку, скоро свяжусь для уточнений."
         return "Здравствуйте! Это Владимир из агентства RealDream на Пхукете. Получил вашу заявку, скоро свяжусь для уточнений."
+
+    # Путь 1: движок стиля (роутер не нужен — сценарий известен заранее).
+    try:
+        pack_id = "initial_contact_after_lead"
+        style_payload = {
+            "request_id": f"first-touch-{lead.get('id')}",
+            "channel": (lead.get("preferred_channel") or "whatsapp").lower(),
+            "deal_stage": "new_lead",
+            "client_last_message_type": "new_lead",
+            "last_client_message_summary": (lead.get("request_text") or "Новая заявка с сайта/рекламы.")[:300],
+            "client_situation_hint": (
+                f"Новый лид, имя клиента: {name_first or 'не указано'}. "
+                f"Источник: {(lead.get('source') or 'не указан')[:100]}. "
+                "Первое касание сразу после заявки: поприветствовать по имени, представиться "
+                "(Владимир, агентство RealDream, Пхукет), подтвердить получение заявки, один мягкий вопрос."
+            ),
+            "facts_available": [],
+        }
+        runtime_state = _style_load_runtime_pack(pack_id)
+        style_memory = _style_select_memory_records(style_payload, pack_id)
+        pack_text = runtime_state.get("pack_text") or ""
+        memory_text = _style_format_memory_for_prompt(style_memory)
+        if memory_text:
+            pack_text = f"{pack_text}\n\n{memory_text}" if pack_text else memory_text
+        if pack_text:
+            draft_text, safety = await _style_generate_with_retries(style_payload, pack_id, pack_text, style_memory)
+            if draft_text and safety.get("pass"):
+                log.info("3min-message: style engine draft used (pack=%s, memory=%d)", pack_id, len(style_memory.get("examples") or []))
+                return draft_text
+            log.info("3min-message: style engine blocked/empty (%s), falling back", safety.get("flags"))
+    except Exception as e:
+        log.warning(f"3min-message style engine failed: {e}, falling back")
+
+    # Путь 2: прежний generic-промпт.
     try:
         import anthropic
         cli = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
@@ -575,12 +613,12 @@ async def _generate_3min_message(lead: dict) -> str:
         )
         user = f"Заявка: {lead.get('name','')[:200]}\nИмя клиента: {name_first or 'не указано'}\nИсточник: {lead.get('source','')}"
         resp = await cli.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model=STYLE_WRITER_MODEL,
             max_tokens=200,
             system=sys_prompt,
             messages=[{"role": "user", "content": user}],
         )
-        return resp.content[0].text.strip()
+        return _style_normalize_client_text(resp.content[0].text)
     except Exception as e:
         log.warning(f"3min-message claude failed: {e}, using fallback")
         if name_first:
@@ -2690,8 +2728,30 @@ def _style_choose_pack(payload: dict) -> tuple[str, list[str], str]:
     text = " ".join(str(payload.get(k) or "") for k in (
         "client_situation_hint", "last_client_message_summary", "deal_stage", "client_last_message_type",
     )).lower()
-    if any(k in text for k in ("цена", "price", "roi", "доход", "окуп", "рассроч", "payment")):
+    stage = str(payload.get("deal_stage") or "").lower()
+
+    # Рискованные сценарии (деньги/юридика/оплата) — первыми: у них жёсткий safety gate.
+    if any(k in text for k in ("цена", "price", "roi", "доход", "окуп", "стоимост", "бюджет")):
         return "price_roi_explanation", ["client_asks_question"], "Запрос связан с ценой/деньгами, поэтому выбран денежный pack с жёстким safety gate."
+    if any(k in text for k in ("юрид", "доверенност", "удаленн", "удалённ", "дистанцион", "freehold", "leasehold", "фрихолд", "лизхолд", "собственност")):
+        return "legal_remote_purchase_explanation", ["client_asks_question"], "Юридическая схема/удалённая покупка: жёсткий запрет на гарантии без источника."
+    if any(k in text for k in ("оплат", "платеж", "платёж", "рассроч", "документ", "перевод", "swift", "инвойс", "договор")):
+        return "payment_and_documents_explanation", ["client_asks_question"], "Вопрос про оплату/документы: только факты из текущей сделки."
+
+    # Сценарии по стадии/намерению.
+    if any(k in text for k in ("брон", "депозит", "задаток", "готов покупать", "оформля")) or stage in ("booking", "closing"):
+        return "closing_from_selection_to_booking", ["payment_and_documents_explanation"], "Клиент близок к брони: переход от подбора к бронированию."
+    if any(k in text for k in ("zoom", "зум", "созвон", "видеозвон", "по видео")) or stage in ("zoom_scheduling", "call_scheduling"):
+        return "zoom_or_call_scheduling", ["client_asks_question"], "Назначение созвона/Zoom."
+    if any(k in text for k in ("встреч", "показ", "приед", "прилет", "прилёт", "на месте", "посмотреть вживую")) or stage in ("visit", "meeting"):
+        return "meeting_and_visit_closing", ["zoom_or_call_scheduling"], "Личная встреча/показ объекта."
+    if any(k in text for k in ("подбор", "подборк", "вариант", "что посоветуете", "какие районы")) or stage == "selection":
+        return "object_selection_explainer", ["client_asks_question"], "Подбор объектов: объяснить логику выбора."
+    if stage in ("new_lead", "contact_not_established") or payload.get("client_last_message_type") == "new_lead":
+        return "initial_contact_after_lead", ["client_asks_question"], "Новый лид: первое касание после заявки."
+    if any(k in text for k in ("не отвеча", "пропал", "холодн")) or stage in ("cold", "soft_close"):
+        return "soft_close_or_cold", ["long_silence_reactivation"], "Холодный клиент: мягкое закрытие без давления."
+
     if payload.get("silence_days") not in (None, "", 0) or "silence" in text or "молч" in text:
         try:
             silence_days = float(payload.get("silence_days") or 0)
@@ -2948,6 +3008,84 @@ async def _style_generate_with_retries(
     return draft_text, safety
 
 
+STYLE_WRITER = os.environ.get("STYLE_WRITER", "claude").strip().lower()  # claude | ollama
+STYLE_WRITER_MODEL = os.environ.get("STYLE_WRITER_MODEL", "claude-sonnet-4-6").strip()
+
+
+def _style_normalize_client_text(text: str) -> str:
+    """Жёсткое правило стиля Владимира: длинное/среднее тире — признак AI-текста."""
+    return (text or "").replace(" — ", ", ").replace(" – ", ", ").replace("—", "-").replace("–", "-").strip()
+
+
+def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str]:
+    """Единый prompt писателя — тот же контракт, что у Mac/Ollama style_runtime_server."""
+    channel = (payload.get("channel") or "app").lower()
+    is_messenger = channel in ("whatsapp", "telegram")
+    facts = payload.get("facts_available") or []
+    has_price_source = "price_source_ref" in facts
+    length_note = "1–3 предложения" if is_messenger else "3–5 предложений"
+    price_note = (
+        "Конкретные цены, проценты, доходность — НЕ упоминать: нет подтверждённого источника."
+        if not has_price_source
+        else "Конкретные цифры — только из подтверждённого источника, без выдумок."
+    )
+    parts = []
+    if payload.get("last_client_message_summary"):
+        parts.append(f"Последнее сообщение клиента: {payload['last_client_message_summary']}")
+    if payload.get("last_vladimir_message_summary"):
+        parts.append(f"Последнее сообщение Владимира: {payload['last_vladimir_message_summary']}")
+    if payload.get("silence_days"):
+        parts.append(f"Клиент молчал {payload['silence_days']} дней.")
+    if payload.get("deal_stage"):
+        parts.append(f"Стадия: {payload['deal_stage']}.")
+    if payload.get("client_situation_hint"):
+        parts.append(f"Подсказка: {payload['client_situation_hint']}.")
+    snapshot = payload.get("deal_context_snapshot") or {}
+    demand = str(((snapshot.get("client_state") or {}).get("demand_status")) or "").lower()
+    if demand in ("not_actual", "uncertain") or payload.get("dialogue_transferred"):
+        parts.append(
+            "Клиент ранее говорил, что вопрос может быть не актуален. "
+            "Обязательно мягко уточни, актуален ли вопрос сейчас, и используй слово «актуально» или «актуален»."
+        )
+    user_content = (
+        "\n".join(parts)
+        + f"\n\nКанал: {channel}. Длина: {length_note}. {price_note}"
+        + "\n\nНапиши черновик ответа Владимира. Только текст, без заголовков и пояснений."
+    )
+    system_prompt = (
+        "Ты помогаешь Владимиру — агенту по недвижимости в Пхукете — писать ответы клиентам. "
+        "Используй стиль и паттерны из пака ниже: структуру, тон, типичные CTA. "
+        "Не копируй фразы дословно — повторяй структуру и тон. "
+        "Пиши только по-русски. Никогда не используй длинное тире (—) и среднее тире (–): "
+        "только запятая, точка или короткий дефис. "
+        "Пиши только текст черновика ответа, без заголовков и пояснений.\n\n"
+        + pack_text
+    )
+    return system_prompt, user_content
+
+
+async def _style_write_draft_claude(payload: dict, pack_id: str, pack_text: str) -> str:
+    """Основной писатель: Claude API. pack_text стабилен per pack — кэшируется."""
+    import anthropic
+    cli = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    system_prompt, user_content = _style_writer_prompts(payload, pack_text)
+    resp = await cli.messages.create(
+        model=STYLE_WRITER_MODEL,
+        max_tokens=350,
+        thinking={"type": "disabled"},
+        output_config={"effort": "low"},
+        system=[{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        messages=[{"role": "user", "content": user_content}],
+    )
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    log.info("style_draft: generated %d chars for pack %s via %s", len(text), pack_id, STYLE_WRITER_MODEL)
+    return _style_normalize_client_text(text)
+
+
 async def _style_write_draft(payload: dict, pack_id: str, pack_text: str = "") -> str:
     channel = (payload.get("channel") or "app").lower()
     is_messenger = channel in ("whatsapp", "telegram")
@@ -2955,6 +3093,17 @@ async def _style_write_draft(payload: dict, pack_id: str, pack_text: str = "") -
 
     if not pack_text:
         return _fallback
+
+    # Основной путь: Claude API (качество имитации стиля). При ошибке/пустом
+    # ответе — fallback на Mac/Ollama writer ниже (бесплатный, но слабее).
+    if STYLE_WRITER == "claude" and ANTHROPIC_API_KEY:
+        try:
+            text = await _style_write_draft_claude(payload, pack_id, pack_text)
+            if text:
+                return text
+            log.warning("style_draft: Claude writer returned empty text, falling back to Mac/Ollama")
+        except Exception as exc:
+            log.warning("style_draft: Claude writer failed (%s), falling back to Mac/Ollama", str(exc)[:200])
 
     http_base = (STYLE_RUNTIME_HTTP_BASE_URL or "").rstrip("/")
     http_token = STYLE_RUNTIME_HTTP_TOKEN or ""
