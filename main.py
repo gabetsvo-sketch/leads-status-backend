@@ -1469,6 +1469,13 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
         enriched = dict(t)
         if enriched.get("request_text"):
             enriched["request_text"] = _clean_request_text(enriched["request_text"])
+        # Инцидент 2026-06-12: строка вместо объекта в last_significant_contact
+        # ломала decode ВСЕГО списка в iOS — приложение молча показывало старый
+        # кэш. Сервер нормализует формат, чтобы один кривой продюсер карточек
+        # не оставил Владимира на устаревших данных.
+        lsc = enriched.get("last_significant_contact")
+        if isinstance(lsc, str):
+            enriched["last_significant_contact"] = {"date": lsc, "channel": None, "meaning": None}
         lid = enriched.get("lead_id")
         if not lid:
             if enriched.get("client_tz_offset_min") is None and not enriched.get("client_tz_label"):

@@ -944,3 +944,22 @@ def test_mark_sent_writes_sent_event_for_obsidian(app_client, widget_headers, in
     # endpoint закрыт от widget-токена
     r = client.get("/api/internal/tasks/sent_events", headers=widget_headers)
     assert r.status_code in (401, 403)
+
+
+def test_string_last_significant_contact_normalized_to_object(app_client, widget_headers, internal_headers):
+    """Инцидент 2026-06-12: строка в last_significant_contact ломала decode
+    всего списка задач в iOS (ждёт объект) — приложение молча показывало кэш."""
+    client, _ = app_client
+    client.post(
+        "/api/internal/tasks",
+        headers=internal_headers,
+        json={"tasks": [{
+            "task_id": 9910, "lead_id": 999910, "due": "2099-01-01T10:00:00+07:00",
+            "created_by": 0, "created_by_name": "system", "task_text": "Связаться",
+            "lead_name": "Тест", "phone": "", "amocrm_url": "https://example.invalid/leads/detail/999910",
+            "last_significant_contact": "2026-05-04",
+        }]},
+    )
+    task = client.get("/api/tasks/today", headers=widget_headers).json()["tasks"][0]
+    lsc = task["last_significant_contact"]
+    assert isinstance(lsc, dict) and lsc["date"] == "2026-05-04"
