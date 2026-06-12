@@ -82,6 +82,9 @@ STYLE_RUNTIME_CACHE_TTL_SECONDS = int(os.environ.get("STYLE_RUNTIME_CACHE_TTL_SE
 STYLE_RUNTIME_R2_ACCESS_KEY_ID = os.environ.get("STYLE_RUNTIME_R2_ACCESS_KEY_ID", "").strip()
 STYLE_RUNTIME_R2_SECRET_ACCESS_KEY = os.environ.get("STYLE_RUNTIME_R2_SECRET_ACCESS_KEY", "").strip()
 STYLE_RUNTIME_FEEDBACK_FILE = Path(os.environ.get("STYLE_RUNTIME_FEEDBACK_FILE", "/var/data/style_runtime_feedback.jsonl"))
+# 2026-06-12 (запрос Владимира): журнал отправок клиентам. Mac-воркер забирает
+# события и складывает в Obsidian, чтобы движок стиля учился на реальных правках.
+SENT_EVENTS_FILE = Path(os.environ.get("SENT_EVENTS_FILE", "/var/data/sent_events.jsonl"))
 STYLE_RUNTIME_HTTP_BASE_URL = os.environ.get("STYLE_RUNTIME_HTTP_BASE_URL", "").strip().rstrip("/")
 STYLE_RUNTIME_HTTP_TOKEN = os.environ.get("STYLE_RUNTIME_HTTP_TOKEN", "").strip()
 STYLE_MEMORY_FILE = Path(os.environ.get(
@@ -1933,8 +1936,53 @@ async def task_mark_sent_manually(
     target["needs_send"] = needs_analysis
 
     save_tasks(tasks_today)
+    try:
+        SENT_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with SENT_EVENTS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": now_iso,
+                "event": "sent_manually",
+                "task_id": task_id,
+                "lead_id": target.get("lead_id"),
+                "lead_name": target.get("lead_name"),
+                "channel": target.get("last_message_channel") or target.get("last_incoming_channel") or "",
+                "stage": target.get("stage") or "",
+                "pack_id": target.get("style_runtime_pack_id") or "",
+                "original_message": original,
+                "final_message": edited or original,
+                "edited": is_edited,
+                "note": note,
+            }, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        log.warning(f"sent_events append failed: {exc}")
     log.info(f"task#{task_id}: marked sent_manually → awaiting_reply (edited={is_edited})")
     return {"status": "ok", "task_id": task_id, "needs_analysis": is_edited}
+
+
+@app.get("/api/internal/tasks/sent_events")
+async def list_sent_events(
+    after_ts: str = Query(""),
+    limit: int = Query(100, ge=1, le=500),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac-воркер забирает события отправок (курсор after_ts — ISO timestamp
+    последнего обработанного события) и пишет их в Obsidian для движка стиля."""
+    check_internal(authorization)
+    # «+» в ISO-времени приходит из URL как пробел — возвращаем обратно.
+    after_ts = after_ts.strip().replace(" 00:00", "+00:00")
+    events = []
+    if SENT_EVENTS_FILE.exists():
+        for line in SENT_EVENTS_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if after_ts and (e.get("ts") or "") <= after_ts:
+                continue
+            events.append(e)
+            if len(events) >= limit:
+                break
+    return {"count": len(events), "events": events}
 
 
 @app.post("/api/internal/tasks/{task_id}/client_replied")

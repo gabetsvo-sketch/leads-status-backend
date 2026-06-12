@@ -903,3 +903,44 @@ def test_request_text_hides_empty_form_fields(app_client, widget_headers, intern
     lead = client.get("/api/leads?only_unacked=false&limit=50", headers=widget_headers).json()["leads"][0]
     for line in (lead["request_text"] or "").splitlines():
         assert not line.rstrip().endswith(":")
+
+
+def test_mark_sent_writes_sent_event_for_obsidian(app_client, widget_headers, internal_headers):
+    """Запрос Владимира 2026-06-12: каждая отправка клиенту попадает в журнал,
+    который Mac-воркер выгружает в Obsidian для обучения движка стиля."""
+    client, _ = app_client
+    client.post(
+        "/api/internal/tasks",
+        headers=internal_headers,
+        json={"tasks": [{
+            "task_id": 9905, "lead_id": 999905, "due": "2099-01-01T10:00:00+07:00",
+            "created_by": 0, "created_by_name": "system", "task_text": "Связаться",
+            "lead_name": "Тест", "phone": "", "amocrm_url": "https://example.invalid/leads/detail/999905",
+            "suggested_message": "Исходный черновик офиса",
+            "last_message_channel": "telegram", "style_runtime_pack_id": "long_silence_reactivation",
+        }]},
+    )
+    r = client.post(
+        "/api/tasks/9905/mark_sent_manually",
+        headers=widget_headers,
+        json={"edited_message": "Текст, который Владимир реально отправил"},
+    )
+    assert r.status_code == 200 and r.json()["needs_analysis"] is True
+
+    r = client.get("/api/internal/tasks/sent_events", headers=internal_headers)
+    assert r.status_code == 200
+    events = r.json()["events"]
+    assert len(events) == 1
+    e = events[0]
+    assert e["task_id"] == 9905 and e["edited"] is True
+    assert e["original_message"] == "Исходный черновик офиса"
+    assert e["final_message"] == "Текст, который Владимир реально отправил"
+    assert e["channel"] == "telegram" and e["pack_id"] == "long_silence_reactivation"
+
+    # курсор after_ts отсекает уже обработанные события
+    r = client.get(f"/api/internal/tasks/sent_events?after_ts={e['ts']}", headers=internal_headers)
+    assert r.json()["count"] == 0
+
+    # endpoint закрыт от widget-токена
+    r = client.get("/api/internal/tasks/sent_events", headers=widget_headers)
+    assert r.status_code in (401, 403)
