@@ -1378,6 +1378,9 @@ async def internal_tasks(
     tasks_today = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "tasks": merged,
+        # Полная замена касается только активных задач — выполненные за
+        # сегодня живут своим 24-часовым циклом (_prune_completed_today).
+        "completed_today": tasks_today.get("completed_today") or [],
     }
     save_tasks(tasks_today)
     preserved = sum(1 for t in merged if t.get("action_state") or t.get("pending_send"))

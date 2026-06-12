@@ -815,3 +815,55 @@ def test_internal_lead_normalizes_sakhalin_custom_field_timezone(app_client, int
     assert "Москва" not in lead["client_tz_label"]
     assert lead["client_tz_offset_min"] > 420
 
+
+
+def test_internal_tasks_push_preserves_completed_today(app_client, widget_headers, internal_headers):
+    """Regression: полная замена tasks не должна стирать completed_today.
+
+    Сценарий: задача закрыта (попала в completed_today) → приходит новый
+    snapshot задач → выполненные за сегодня обязаны остаться в выдаче.
+    """
+    client, _ = app_client
+
+    def _task(task_id):
+        return {
+            "task_id": task_id,
+            "lead_id": 999800 + task_id,
+            "due": "2099-01-01T10:00:00+07:00",
+            "created_by": 0,
+            "created_by_name": "system",
+            "task_text": "Связаться",
+            "lead_name": "Клиент",
+            "phone": "",
+            "amocrm_url": f"https://example.invalid/leads/detail/{999800 + task_id}",
+        }
+
+    r = client.post(
+        "/api/internal/tasks",
+        headers=internal_headers,
+        json={"tasks": [_task(7001), _task(7002)]},
+    )
+    assert r.status_code == 200
+
+    r = client.post("/api/tasks/7001/close_no_followup", headers=widget_headers)
+    assert r.status_code == 200
+    r = client.post("/api/internal/tasks/7001/closed", headers=internal_headers)
+    assert r.status_code == 200
+
+    r = client.get("/api/tasks/today", headers=widget_headers)
+    completed_ids = [t["task_id"] for t in r.json()["completed_today"]]
+    assert 7001 in completed_ids
+
+    # Новая пачка задач (полная замена) — completed_today не должен пропасть
+    r = client.post(
+        "/api/internal/tasks",
+        headers=internal_headers,
+        json={"tasks": [_task(7003)]},
+    )
+    assert r.status_code == 200
+
+    r = client.get("/api/tasks/today", headers=widget_headers)
+    body = r.json()
+    assert [t["task_id"] for t in body["tasks"]] == [7003]
+    completed_ids = [t["task_id"] for t in body["completed_today"]]
+    assert 7001 in completed_ids, "полный пуш задач стёр completed_today"
