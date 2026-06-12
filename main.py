@@ -2471,18 +2471,48 @@ def _style_meaning_says_not_actual(*values) -> bool:
     return any(marker in text for marker in _STYLE_NOT_ACTUAL_MARKERS)
 
 
+# Феедбек Владимира 2026-06-12: пустые звонки (несколько секунд, автоответчик)
+# не должны блокировать черновик как «непрочитанный обязательный звонок».
+_STYLE_CALL_MIN_MEANINGFUL_SEC = int(os.environ.get("STYLE_CALL_MIN_MEANINGFUL_SEC", "30"))
+_STYLE_IGNORABLE_CALL_STATUSES = {"empty_or_voicemail", "voicemail_only", "short_calls_only"}
+
+
+def _style_normalize_source_status(value):
+    """Статус источника + понижение «missing_required» до «short_calls_only»,
+    если все звонки источника короче порога (пустые/автоответчик)."""
+    if not isinstance(value, dict):
+        return value
+    status = value.get("status")
+    if status == "missing_required":
+        durations = []
+        if value.get("max_duration_sec") is not None:
+            durations.append(value.get("max_duration_sec"))
+        for item in value.get("calls") or []:
+            if isinstance(item, dict):
+                durations.append(item.get("duration") or item.get("duration_sec") or 0)
+            elif isinstance(item, (int, float)):
+                durations.append(item)
+        try:
+            if durations and max(float(d or 0) for d in durations) < _STYLE_CALL_MIN_MEANINGFUL_SEC:
+                return "short_calls_only"
+        except (TypeError, ValueError):
+            pass
+    return status
+
+
 def _style_normalize_source_coverage(snapshot: dict) -> dict:
     raw = snapshot.get("source_coverage") if isinstance(snapshot, dict) else None
     if not isinstance(raw, dict):
         raw = {}
     normalized = {}
     for source_type in _STYLE_CONTEXT_SOURCE_TYPES:
-        status = raw.get(source_type) or raw.get(source_type.replace("_transcripts", ""))
-        if isinstance(status, dict):
-            status = status.get("status")
+        status = raw.get(source_type)
+        if status is None:
+            status = raw.get(source_type.replace("_transcripts", ""))
+        status = _style_normalize_source_status(status)
         normalized[source_type] = status or "not_present"
     for key, value in raw.items():
-        normalized.setdefault(key, value.get("status") if isinstance(value, dict) else value)
+        normalized.setdefault(key, _style_normalize_source_status(value))
     return normalized
 
 

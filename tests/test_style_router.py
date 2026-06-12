@@ -89,3 +89,34 @@ def test_pokupka_does_not_trigger_price_pack(app_client):
         {"last_client_message_summary": "Какая окупаемость у этого проекта?"}
     )
     assert pack_id == "price_roi_explanation"
+
+
+def test_empty_calls_do_not_block_draft(app_client):
+    """Феедбек Владимира 2026-06-12: пустые звонки (автоответчик, пара секунд)
+    не должны блокировать черновик флагом missing_call_context."""
+    _, main = app_client
+
+    # Все звонки короткие → понижаем до short_calls_only, блока нет
+    payload_short = {"deal_context_snapshot": {"source_coverage": {
+        "call_transcripts": {"status": "missing_required", "calls": [{"duration": 7}, {"duration": 12}]},
+    }}}
+    status, missing, _ = main._style_context_status(payload_short)
+    assert status == "ok" and missing == []
+    gate = main._style_safety_gate(payload_short, "Добрый день! Возвращаюсь к нашему разговору.", "long_silence_reactivation")
+    assert "missing_call_context" not in gate["flags"]
+
+    # Явная пометка «автоответчик» тоже не блокирует
+    payload_vm = {"deal_context_snapshot": {"source_coverage": {
+        "call_transcripts": {"status": "empty_or_voicemail"},
+    }}}
+    status, missing, _ = main._style_context_status(payload_vm)
+    assert status == "ok" and missing == []
+
+    # Содержательный непрочитанный звонок — блок остаётся
+    payload_real = {"deal_context_snapshot": {"source_coverage": {
+        "call_transcripts": {"status": "missing_required", "calls": [{"duration": 240}]},
+    }}}
+    status, missing, _ = main._style_context_status(payload_real)
+    assert status == "needs_context_review" and "call_transcripts" in missing
+    gate = main._style_safety_gate(payload_real, "Добрый день!", "long_silence_reactivation")
+    assert "missing_call_context" in gate["flags"] and gate["pass"] is False
