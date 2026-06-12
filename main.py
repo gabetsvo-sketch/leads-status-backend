@@ -192,6 +192,30 @@ def _prune_completed_today(payload: dict) -> None:
 def save_tasks(payload: dict) -> None:
     TASKS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
+
+_EMPTY_FORM_FIELD_RE = re.compile(r"^\s*[^:\n]{1,60}:{1,2}\s*$")
+
+
+def _clean_request_text(text) -> str:
+    """Убирает из анкеты клиента незаполненные поля («Цель:», «Удобный мессенджер:»
+    без ответа). Феедбек Владимира 2026-06-12: показываем только то, что клиент
+    реально заполнил. Влияет только на выдачу API, исходные данные не трогает."""
+    if not text:
+        return text or ""
+    lines = []
+    for line in str(text).splitlines():
+        if _EMPTY_FORM_FIELD_RE.match(line):
+            continue
+        lines.append(line.rstrip())
+    cleaned, prev_blank = [], True
+    for line in lines:
+        blank = not line.strip()
+        if blank and prev_blank:
+            continue
+        cleaned.append(line)
+        prev_blank = blank
+    return "\n".join(cleaned).strip()
+
 def _normalize_tz_text(value) -> str:
     return (str(value or "")
             .strip()
@@ -1047,9 +1071,14 @@ async def list_leads(
     items = leads_inbox
     if only_unacked:
         items = [L for L in items if not L.get("acked")]
+    out = []
+    for L in items[:limit]:
+        if L.get("request_text"):
+            L = {**L, "request_text": _clean_request_text(L["request_text"])}
+        out.append(L)
     return {
         "count": len(items),
-        "leads": items[:limit],
+        "leads": out,
     }
 
 
@@ -1435,6 +1464,8 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
 
     def _enrich(t: dict) -> dict:
         enriched = dict(t)
+        if enriched.get("request_text"):
+            enriched["request_text"] = _clean_request_text(enriched["request_text"])
         lid = enriched.get("lead_id")
         if not lid:
             if enriched.get("client_tz_offset_min") is None and not enriched.get("client_tz_label"):
@@ -1451,7 +1482,7 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
             return _mark_missing_contact_context(enriched)
         for key in ("request_text", "client_city", "client_tz_offset_min", "client_tz_label", "telegram_username"):
             if (enriched.get(key) is None or enriched.get(key) == "") and L.get(key) not in (None, ""):
-                enriched[key] = L.get(key)
+                enriched[key] = _clean_request_text(L.get(key)) if key == "request_text" else L.get(key)
         if (not enriched.get("phone")) and L.get("phone"):
             enriched["phone"] = L.get("phone")
         if (not enriched.get("whatsapp_phone")) and (L.get("whatsapp_phone") or L.get("phone")):

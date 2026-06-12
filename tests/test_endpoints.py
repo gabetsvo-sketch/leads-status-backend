@@ -867,3 +867,39 @@ def test_internal_tasks_push_preserves_completed_today(app_client, widget_header
     assert [t["task_id"] for t in body["tasks"]] == [7003]
     completed_ids = [t["task_id"] for t in body["completed_today"]]
     assert 7001 in completed_ids, "полный пуш задач стёр completed_today"
+
+
+def test_request_text_hides_empty_form_fields(app_client, widget_headers, internal_headers):
+    """Феедбек Владимира 2026-06-12: пустые поля анкеты («Цель:» без ответа)
+    не должны попадать в карточку — показываем только заполненное."""
+    client, _ = app_client
+    raw = ("Цель:\nУдобный мессенджер:\nБывали ли на Пхукете:\n\n"
+           "Вопросы: Цель покупки:: Для инвестиции\n"
+           "Были ли вы на Пхукете:: Нет\n"
+           "Удобный Месседжер:: Max")
+    client.post(
+        "/api/internal/lead",
+        headers=internal_headers,
+        json={"lead_id": 999900, "name": "Марина", "phone": "+79990009900", "request_text": raw},
+    )
+    r = client.post(
+        "/api/internal/tasks",
+        headers=internal_headers,
+        json={"tasks": [{
+            "task_id": 9901, "lead_id": 999900, "due": "2099-01-01T10:00:00+07:00",
+            "created_by": 0, "created_by_name": "system", "task_text": "Связаться",
+            "lead_name": "Марина", "phone": "", "amocrm_url": "https://example.invalid/leads/detail/999900",
+        }]},
+    )
+    assert r.status_code == 200
+
+    task = client.get("/api/tasks/today", headers=widget_headers).json()["tasks"][0]
+    text = task["request_text"]
+    assert "Цель:\n" not in text and "Удобный мессенджер:" not in text.split("\n")[0:1]
+    for line in text.splitlines():
+        assert not line.rstrip().endswith(":"), f"пустое поле анкеты просочилось: {line!r}"
+    assert "Для инвестиции" in text and "Max" in text
+
+    lead = client.get("/api/leads?only_unacked=false&limit=50", headers=widget_headers).json()["leads"][0]
+    for line in (lead["request_text"] or "").splitlines():
+        assert not line.rstrip().endswith(":")
