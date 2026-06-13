@@ -36,19 +36,43 @@ def test_style_runtime_draft_blocks_missing_price_source_and_never_sends(app_cli
 
     r = client.post("/style-runtime/v1/draft", headers=office_headers, json=BASE_REQUEST)
 
+    # Новый контракт (2026-06-13): блокируем не «тему цены», а только когда в ТЕКСТЕ
+    # черновика реально появилась конкретная цифра без подтверждённого источника.
+    # Черновик на ценовую тему без выдуманных чисел показывать можно — он безопасен
+    # и полезен. Прежний контракт глушил такие черновики в пустоту (жалоба Владимира).
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["request_id"] == BASE_REQUEST["request_id"]
     assert body["manual_review_only"] is True
     assert body["show_to_vladimir"] is True
-    assert body["safety_pass"] is False
-    assert body["risk_level"] == "high"
-    assert "price_source_ref" in body["missing_facts"]
-    assert "price_without_source" in body["safety_flags"]
-    assert body["block_reason"]
-    assert body["draft_text"] == ""
+    # Чистый черновик без цифр проходит; жёсткий флаг цены НЕ выставлен.
+    assert "price_without_source" not in body["safety_flags"]
+    # Side effects по-прежнему запрещены — рантайм ничего не отправляет и не пишет в CRM.
     assert body["send_performed"] is False
     assert body["crm_mutated"] is False
+
+
+def test_style_safety_gate_blocks_unsourced_price_figure_in_draft():
+    """Главная гарантия безопасности сохранена: конкретная цифра (сумма/процент) без
+    источника обнуляет черновик, чтобы клиенту не ушла выдуманная цена."""
+    import main
+
+    gate = main._style_safety_gate(
+        {"last_client_message_summary": "клиент спрашивает про цену"},
+        "Этот вариант стоит 5 млн бат, доходность около 7% годовых.",
+        "price_roi_explanation",
+    )
+    assert gate["pass"] is False
+    assert "price_without_source" in gate["flags"]
+    assert "price_source_ref" in gate["missing_facts"]
+
+    # А черновик на ту же тему без выдуманных чисел — безопасен и проходит.
+    gate_clean = main._style_safety_gate(
+        {"last_client_message_summary": "клиент спрашивает про цену"},
+        "Подскажу по условиям и сориентирую, актуально ли это сейчас для вас.",
+        "price_roi_explanation",
+    )
+    assert "price_without_source" not in gate_clean["flags"]
 
 
 def test_style_runtime_draft_returns_manual_review_safe_low_risk_reply(app_client, office_headers):

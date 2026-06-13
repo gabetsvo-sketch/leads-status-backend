@@ -218,11 +218,24 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
                 "Обязательно мягко уточни, актуален ли вопрос сейчас, и используй слово «актуально» или «актуален»."
             )
 
+        feedback = str(
+            payload.get("vladimir_feedback")
+            or payload.get("regen_feedback")
+            or payload.get("feedback_text")
+            or ""
+        ).strip()
         user_content = (
             "\n".join(parts)
             + f"\n\nКанал: {channel}. Длина: {length_note}. {price_note}"
-            + "\n\nНапиши черновик ответа Владимира. Только текст, без заголовков и пояснений."
         )
+        if feedback:
+            user_content += (
+                "\n\n!!! ГЛАВНОЕ ТРЕБОВАНИЕ. Владимир прочитал прошлый черновик и просит "
+                "переписать его так:\n"
+                f"«{feedback}»\n"
+                "Выполни эту правку буквально и в первую очередь."
+            )
+        user_content += "\n\nНапиши черновик ответа Владимира. Только текст, без заголовков и пояснений."
         system_prompt = (
             "Ты помогаешь Владимиру — агенту по недвижимости в Пхукете — писать ответы клиентам. "
             "Используй стиль и паттерны из пака ниже: структуру, тон, типичные CTA. "

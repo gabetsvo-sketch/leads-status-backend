@@ -3037,15 +3037,23 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
         missing.extend(missing_sources)
 
     price_intent = pack_id == "price_roi_explanation" or any(k in summary for k in ("цена", "price", "roi", "доход", "рассроч")) or bool(re.search(r"\bокуп", summary))
+    # Блокируем не «тему цены», а только если в ТЕКСТЕ черновика реально появилась
+    # конкретная цифра (сумма/процент) без подтверждённого источника. Иначе обычный
+    # ответ на ценовой вопрос (без выдуманных чисел) зря обнулялся.
+    draft_has_price_figure = bool(
+        re.search(r"\d[\d\s.,]*\s*(?:млн|тыс|руб|฿|бат|baht|thb|\$|%|процент)", (draft_text or "").lower())
+    )
     if price_intent:
         risk = "high"
-        if "price_source_ref" not in facts:
+        if "price_source_ref" not in facts and draft_has_price_figure:
             flags.append("price_without_source")
             missing.append("price_source_ref")
     if any(k in summary for k in ("договор", "юрид", "freehold", "leasehold", "платеж", "платёж")):
         risk = "high"
     cta_count = _style_count_cta(draft_text)
-    if cta_count > 1:
+    # Порог 2: один призыв + один уточняющий вопрос - нормальное сообщение.
+    # Блокируем только перегруз (3+ вопроса/призыва в одном черновике).
+    if cta_count > 2:
         flags.append("too_many_cta")
     flags.extend(_style_client_text_forbidden_flags(draft_text))
     flags.extend(_style_memory_guard_flags(draft_text, style_memory or {}))
@@ -3160,17 +3168,46 @@ def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str]:
     if payload.get("client_situation_hint"):
         parts.append(f"Подсказка: {payload['client_situation_hint']}.")
     snapshot = payload.get("deal_context_snapshot") or {}
+    # Реальный контекст сделки — последний значимый контакт и о чём договаривались.
+    # Раньше snapshot использовался только для блокировок; теперь писатель его видит.
+    last_contact = payload.get("last_significant_contact") or snapshot.get("last_vladimir_contact") or {}
+    if isinstance(last_contact, dict):
+        contact_line = " ".join(
+            str(last_contact.get(k) or "").strip() for k in ("channel", "date") if last_contact.get(k)
+        )
+        if contact_line:
+            parts.append(f"Последний значимый контакт: {contact_line}.")
+        if last_contact.get("meaning"):
+            parts.append(f"О чём договаривались / чем закончилось: {last_contact['meaning']}")
     demand = str(((snapshot.get("client_state") or {}).get("demand_status")) or "").lower()
     if demand in ("not_actual", "uncertain") or payload.get("dialogue_transferred"):
         parts.append(
             "Клиент ранее говорил, что вопрос может быть не актуален. "
             "Обязательно мягко уточни, актуален ли вопрос сейчас, и используй слово «актуально» или «актуален»."
         )
+    # Прямое пожелание Владимира к черновику (правка из приложения). Это главное
+    # требование при перегенерации — ставим его отдельным заметным блоком в конец,
+    # чтобы модель не растворила его среди общих правил пака.
+    feedback = str(
+        payload.get("vladimir_feedback")
+        or payload.get("regen_feedback")
+        or payload.get("feedback_text")
+        or ""
+    ).strip()
     user_content = (
         "\n".join(parts)
         + f"\n\nКанал: {channel}. Длина: {length_note}. {price_note}"
-        + "\n\nНапиши черновик ответа Владимира. Только текст, без заголовков и пояснений."
     )
+    if feedback:
+        user_content += (
+            "\n\n!!! ГЛАВНОЕ ТРЕБОВАНИЕ. Владимир прочитал прошлый черновик и просит "
+            "переписать его так:\n"
+            f"«{feedback}»\n"
+            "Выполни эту правку буквально и в первую очередь. Если она расходится с общими "
+            "правилами пака - приоритет у правки Владимира (кроме запрета длинного тире и "
+            "выдуманных фактов - эти два правила нерушимы)."
+        )
+    user_content += "\n\nНапиши черновик ответа Владимира. Только текст, без заголовков и пояснений."
     system_prompt = (
         "Ты помогаешь Владимиру — агенту по недвижимости в Пхукете — писать ответы клиентам. "
         "Используй стиль и паттерны из пака ниже: структуру, тон, типичные CTA. "
