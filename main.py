@@ -91,6 +91,14 @@ STYLE_MEMORY_FILE = Path(os.environ.get(
     "STYLE_MEMORY_FILE",
     str(STYLE_RUNTIME_DIR / "style-memory-v1-approved-batch-a.jsonl"),
 ))
+# Вшитые в бэкенд обезличенные scenario-паки (реальные фразы-паттерны Владимира).
+# Нужны, чтобы Render-писатель имел стиль/примеры даже при STYLE_RUNTIME_SOURCE=local
+# (раньше local отдавал пустой pack_text → писатель шёл по голым правилам).
+# Пересобираются скриптом tools/bundle_style_packs.py из Obsidian-паков.
+STYLE_PACKS_DIR = Path(os.environ.get(
+    "STYLE_PACKS_DIR",
+    str(Path(__file__).resolve().parent / "style-packs"),
+))
 
 # APNs config (build 20). Файл .p8 либо лежит на диске (APNS_AUTH_KEY_FILE),
 # либо передаётся целиком через env (APNS_AUTH_KEY_CONTENT) — для Render.
@@ -2786,18 +2794,33 @@ def _style_fetch_http_snapshot(pack_id: str) -> dict:
     }
 
 
+def _style_load_local_pack_text(pack_id: str) -> tuple[str, Optional[str]]:
+    """Читает вшитый обезличенный scenario-pack из backend/style-packs/."""
+    if not pack_id:
+        return "", None
+    path = STYLE_PACKS_DIR / f"{pack_id}.md"
+    if not path.exists():
+        return "", None
+    try:
+        return path.read_text(encoding="utf-8").strip(), str(path)
+    except Exception:
+        log.warning("style_runtime: failed to read bundled pack %s", pack_id)
+        return "", None
+
+
 def _style_load_runtime_pack(pack_id: str) -> dict:
     global _STYLE_RUNTIME_R2_CACHE, _STYLE_RUNTIME_R2_LAST_GOOD, _STYLE_RUNTIME_HTTP_CACHE, _STYLE_RUNTIME_HTTP_LAST_GOOD
     if STYLE_RUNTIME_SOURCE not in ("r2", "http"):
         index = _style_load_runtime_index()
+        pack_text, pack_path = _style_load_local_pack_text(pack_id)
         return {
-            "ok": False,
+            "ok": bool(pack_text),
             "source": "local",
             "index": index,
-            "pack_text": "",
-            "pack_path": None,
-            "pack_sha256": None,
-            "snapshot_version": None,
+            "pack_text": pack_text,
+            "pack_path": pack_path,
+            "pack_sha256": _style_sha256_text(pack_text) if pack_text else None,
+            "snapshot_version": "bundled" if pack_text else None,
             "block_reason": None,
         }
 
@@ -2834,6 +2857,21 @@ def _style_load_runtime_pack(pack_id: str) -> dict:
             last_good = dict(last_good_ref["state"])
             last_good["source"] = f"{source_name}_last_good"
             return last_good
+        # Аварийный запас: вшитый локальный пак. Без него простой Mac/ngrok = Render
+        # не может взять пак и глушит черновик в пустоту. С ним движок продолжает писать.
+        local_text, local_path = _style_load_local_pack_text(pack_id)
+        if local_text:
+            log.info("style_runtime: %s недоступен, беру вшитый локальный пак %s", source_name, pack_id)
+            return {
+                "ok": True,
+                "source": f"{source_name}_to_bundled_fallback",
+                "index": _style_load_runtime_index(),
+                "pack_text": local_text,
+                "pack_path": local_path,
+                "pack_sha256": _style_sha256_text(local_text),
+                "snapshot_version": "bundled_fallback",
+                "block_reason": None,
+            }
         return _style_guarded_runtime_state(source_name, reason)
 
 
@@ -2890,7 +2928,7 @@ def _style_count_cta(text: str) -> int:
     return min(text.count("?") + sum(1 for marker in ("напишите", "скажи", "скажите", "удобно") if marker in text.lower()), 3)
 
 
-_STYLE_MEMORY_EXAMPLE_TYPES = {"phrase_pattern", "full_structure", "start", "cta", "tone", "micro_pattern"}
+_STYLE_MEMORY_EXAMPLE_TYPES = {"phrase_pattern", "full_structure", "start", "cta", "tone", "micro_pattern", "style_feature"}
 
 
 def _style_memory_list_contains(values, needle: str) -> bool:
@@ -3040,12 +3078,21 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
     # Блокируем не «тему цены», а только если в ТЕКСТЕ черновика реально появилась
     # конкретная цифра (сумма/процент) без подтверждённого источника. Иначе обычный
     # ответ на ценовой вопрос (без выдуманных чисел) зря обнулялся.
+    draft_low = (draft_text or "").lower()
     draft_has_price_figure = bool(
-        re.search(r"\d[\d\s.,]*\s*(?:млн|тыс|руб|฿|бат|baht|thb|\$|%|процент)", (draft_text or "").lower())
+        re.search(r"\d[\d\s.,]*\s*(?:млн|тыс|руб|฿|бат|baht|thb|\$|%|процент)", draft_low)
+    )
+    # Если конкретную цифру задал сам Владимир в пожелании/подсказке (он просил
+    # «цифры важны, не заменять общими словами»), считаем её подтверждённой - не блокируем.
+    vlad_text = " ".join(str(payload.get(k) or "") for k in (
+        "vladimir_feedback", "regen_feedback", "feedback_text", "client_situation_hint",
+    )).lower()
+    figure_from_vladimir = bool(
+        set(re.findall(r"\d[\d.,]*", draft_low)) & set(re.findall(r"\d[\d.,]*", vlad_text))
     )
     if price_intent:
         risk = "high"
-        if "price_source_ref" not in facts and draft_has_price_figure:
+        if "price_source_ref" not in facts and draft_has_price_figure and not figure_from_vladimir:
             flags.append("price_without_source")
             missing.append("price_source_ref")
     if any(k in summary for k in ("договор", "юрид", "freehold", "leasehold", "платеж", "платёж")):
