@@ -963,3 +963,52 @@ def test_string_last_significant_contact_normalized_to_object(app_client, widget
     task = client.get("/api/tasks/today", headers=widget_headers).json()["tasks"][0]
     lsc = task["last_significant_contact"]
     assert isinstance(lsc, dict) and lsc["date"] == "2026-05-04"
+
+
+def test_priority_classification_flow(app_client, widget_headers, internal_headers):
+    """Фича «Кому написать в первую очередь» (2026-06-13): метки приоритета
+    проставляются воркером, отдаются в /api/tasks/today, переживают полный пуш."""
+    client, _ = app_client
+
+    def _task(tid):
+        return {
+            "task_id": tid, "lead_id": 990000 + tid, "due": "2099-01-01T10:00:00+07:00",
+            "created_by": 0, "created_by_name": "system", "task_text": "Связаться",
+            "lead_name": f"Клиент {tid}", "phone": "",
+            "amocrm_url": f"https://example.invalid/leads/detail/{990000 + tid}",
+        }
+
+    client.post("/api/internal/tasks", headers=internal_headers,
+                json={"tasks": [_task(8001), _task(8002)]})
+
+    # триггер пересборки
+    r = client.post("/api/triggers/reclassify", headers=widget_headers)
+    assert r.status_code == 200
+    r = client.get("/api/internal/triggers/reclassify_request", headers=internal_headers)
+    assert r.status_code == 200 and r.json()["requested_at"]
+
+    # воркер пушит метки
+    r = client.post("/api/internal/tasks/priority", headers=internal_headers, json={"items": [
+        {"task_id": 8001, "priority_tag": "hot", "priority_reason": "Обещан расчёт, тишина 3 дня",
+         "next_step": "Прислать расчёт по рассрочке"},
+        {"task_id": 8002, "priority_tag": "sleeping", "priority_reason": "Молчит 4 месяца", "next_step": "Мягкое касание"},
+    ]})
+    assert r.status_code == 200 and r.json()["updated"] == 2
+
+    tasks = {t["task_id"]: t for t in client.get("/api/tasks/today", headers=widget_headers).json()["tasks"]}
+    assert tasks[8001]["priority_tag"] == "hot"
+    assert tasks[8001]["next_step"] == "Прислать расчёт по рассрочке"
+    assert tasks[8002]["priority_tag"] == "sleeping"
+
+    # метки переживают полный пуш задач (PRESERVE_KEYS)
+    client.post("/api/internal/tasks", headers=internal_headers, json={"tasks": [_task(8001), _task(8002)]})
+    tasks = {t["task_id"]: t for t in client.get("/api/tasks/today", headers=widget_headers).json()["tasks"]}
+    assert tasks[8001]["priority_tag"] == "hot", "метка приоритета стёрта полным пушем"
+    assert tasks[8001]["priority_reason"] == "Обещан расчёт, тишина 3 дня"
+
+    # невалидный тег нормализуется в warm; endpoint закрыт от widget-токена
+    client.post("/api/internal/tasks/priority", headers=internal_headers,
+                json={"items": [{"task_id": 8002, "priority_tag": "мусор"}]})
+    tasks = {t["task_id"]: t for t in client.get("/api/tasks/today", headers=widget_headers).json()["tasks"]}
+    assert tasks[8002]["priority_tag"] == "warm"
+    assert client.post("/api/internal/tasks/priority", headers=widget_headers, json={"items": []}).status_code in (401, 403)

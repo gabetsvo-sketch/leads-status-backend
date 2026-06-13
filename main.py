@@ -1149,6 +1149,77 @@ async def get_refresh_request(
         return {"requested_at": None}
 
 
+# ---------------------------------------------------------------------------
+# Фича «Кому написать в первую очередь» (2026-06-13)
+#
+# iOS жмёт «Обновить список» → POST /api/triggers/reclassify пишет timestamp.
+# Mac priority-воркер опрашивает /api/internal/triggers/reclassify_request,
+# при новом timestamp классифицирует ЗАГРУЖЕННЫЕ задачи (hot/warm/sleeping +
+# причина + следующий шаг) локальной моделью и пушит /api/internal/tasks/priority.
+# ---------------------------------------------------------------------------
+
+RECLASSIFY_REQUEST_FILE = Path(os.environ.get("RECLASSIFY_REQUEST_FILE", "/var/data/reclassify_request.json"))
+
+
+@app.post("/api/triggers/reclassify")
+async def trigger_reclassify(authorization: Optional[str] = Header(default=None)):
+    """iOS просит пересобрать метки приоритета по текущим задачам."""
+    check_token(authorization)
+    RECLASSIFY_REQUEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    RECLASSIFY_REQUEST_FILE.write_text(json.dumps({"requested_at": datetime.now(timezone.utc).isoformat()}))
+    return {"status": "ok"}
+
+
+@app.get("/api/internal/triggers/reclassify_request")
+async def get_reclassify_request(authorization: Optional[str] = Header(default=None)):
+    """Mac priority-воркер poll'ит; при новом timestamp пересобирает приоритеты."""
+    check_internal(authorization)
+    if not RECLASSIFY_REQUEST_FILE.exists():
+        return {"requested_at": None}
+    try:
+        return json.loads(RECLASSIFY_REQUEST_FILE.read_text())
+    except Exception:
+        return {"requested_at": None}
+
+
+@app.post("/api/internal/tasks/priority")
+async def internal_tasks_priority(
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Mac priority-воркер пушит метки: {items: [{task_id, priority_tag,
+    priority_reason, next_step}]}. Проставляем на задачи в tasks_today
+    (active + completed_today). Ничего клиентам не шлём."""
+    check_internal(authorization)
+    items = payload.get("items") or []
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="'items' must be a list")
+    by_id = {}
+    for it in items:
+        tid = it.get("task_id")
+        if tid is None:
+            continue
+        tag = (it.get("priority_tag") or "").strip().lower()
+        if tag not in ("hot", "warm", "sleeping"):
+            tag = "warm"
+        by_id[tid] = {
+            "priority_tag": tag,
+            "priority_reason": (it.get("priority_reason") or "").strip(),
+            "next_step": (it.get("next_step") or "").strip(),
+            "priority_updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    updated = 0
+    for bucket in ("tasks", "completed_today"):
+        for t in tasks_today.get(bucket) or []:
+            patch = by_id.get(t.get("task_id"))
+            if patch:
+                t.update(patch)
+                updated += 1
+    save_tasks(tasks_today)
+    log.info(f"priority: проставлено меток {updated} из {len(by_id)} присланных")
+    return {"status": "ok", "updated": updated}
+
+
 @app.post("/api/internal/heartbeat")
 async def scheduler_heartbeat(
     payload: dict = Body(default={}),
@@ -1395,6 +1466,12 @@ async def internal_tasks(
         "needs_close",
         "close_requested_at",
         "close_error",
+        # Фича «Кому написать в первую очередь» (2026-06-13): метки приоритета
+        # живут на задаче, пересобираются по кнопке — полный пуш не должен их стирать.
+        "priority_tag",
+        "priority_reason",
+        "next_step",
+        "priority_updated_at",
     )
     prior_by_id = {
         t.get("task_id"): {k: t.get(k) for k in PRESERVE_KEYS if k in t}
