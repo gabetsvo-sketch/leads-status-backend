@@ -2053,6 +2053,9 @@ async def task_regenerated(
                 t["rationale"] = rat
             if ctx:
                 t["context_summary"] = ctx
+            ss = payload.get("style_source")
+            if ss is not None:
+                t["style_source"] = ss
             t["needs_regen"] = False
             t.pop("regen_feedback", None)
             t["regen_completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -3191,6 +3194,26 @@ def _style_normalize_client_text(text: str) -> str:
     return (text or "").replace(" — ", ", ").replace(" – ", ", ").replace("—", "-").replace("–", "-").strip()
 
 
+def _style_fetch_similar_sync(situation: str, scenario: str, k: int = 3) -> dict:
+    """Поиск похожих ситуаций в индексе прошлых диалогов (Mac, тот же ngrok-туннель,
+    что и паки). Локальный bge-m3 на Mac → 0 токенов. При недоступности — пусто."""
+    base = (STYLE_RUNTIME_HTTP_BASE_URL or "").rstrip("/")
+    if not base or not (situation or "").strip():
+        return {"results": []}
+    import urllib.request as _req
+    body = json.dumps({"situation": situation, "scenario": scenario, "k": k}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if STYLE_RUNTIME_HTTP_TOKEN:
+        headers["X-Style-Token"] = STYLE_RUNTIME_HTTP_TOKEN
+    req = _req.Request(f"{base}/v1/similar", data=body, headers=headers, method="POST")
+    try:
+        with _req.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        log.warning("style_similar: fetch failed: %s", str(exc)[:160])
+        return {"results": []}
+
+
 def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str]:
     """Единый prompt писателя — тот же контракт, что у Mac/Ollama style_runtime_server."""
     channel = (payload.get("channel") or "app").lower()
@@ -3245,6 +3268,20 @@ def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str]:
         "\n".join(parts)
         + f"\n\nКанал: {channel}. Длина: {length_note}. {price_note}"
     )
+    # Похожие ситуации из прошлых диалогов Владимира (RAG): writer пишет заново,
+    # держась примера, но факты текущей сделки приоритетнее (решение Владимира).
+    similar = payload.get("similar_examples") or []
+    similar = [str(s).strip() for s in similar if str(s).strip()][:3]
+    if similar:
+        examples_block = "\n".join(f"- «{s}»" for s in similar)
+        user_content += (
+            "\n\nПОХОЖИЕ СИТУАЦИИ ИЗ ПРОШЛЫХ ДИАЛОГОВ ВЛАДИМИРА (как он отвечал в близких случаях):\n"
+            f"{examples_block}\n"
+            "Напиши заново в этом ключе - держись тона, структуры и заходов из этих примеров, "
+            "но адаптируй под текущую сделку и её факты. Если контекст текущей сделки не позволяет "
+            "повторить ход примера (другой проект, другая стадия, факт устарел) - не копируй его, "
+            "опирайся на общий стиль. Не выдумывай факты из примеров."
+        )
     if feedback:
         user_content += (
             "\n\n!!! ГЛАВНОЕ ТРЕБОВАНИЕ. Владимир прочитал прошлый черновик и просит "
@@ -3407,6 +3444,27 @@ async def style_runtime_draft(
     ))
 
     pack_id, secondary_pack_ids, router_reason = _style_choose_pack(payload)
+    # RAG: похожие ситуации из прошлых диалогов Владимира. Отбор по реальному паку
+    # (scenario), смыслу, свежести, повторам. Локально на Mac → 0 токенов на поиск.
+    style_source = None
+    if not payload.get("similar_examples"):
+        situation_q = str(
+            payload.get("last_client_message_summary")
+            or payload.get("client_situation_hint")
+            or payload.get("context_summary") or ""
+        ).strip()
+        if situation_q:
+            sim = await asyncio.to_thread(_style_fetch_similar_sync, situation_q, pack_id, 3)
+            results = sim.get("results") or []
+            if results:
+                payload["similar_examples"] = [r.get("reply") for r in results if r.get("reply")]
+                top = results[0]
+                style_source = {
+                    "date": top.get("date") or "",
+                    "scenario": top.get("scenario") or pack_id,
+                    "similarity": top.get("similarity"),
+                    "count": len(results),
+                }
     runtime_state = _style_load_runtime_pack(pack_id)
     style_memory = _style_select_memory_records(payload, pack_id)
     runtime_index = runtime_state.get("index") or {}
@@ -3445,6 +3503,8 @@ async def style_runtime_draft(
         "risk_level": safety["risk_level"],
         "safety_flags": safety["flags"],
         "router_reason": router_reason,
+        "similar_examples_used": len(payload.get("similar_examples") or []),
+        "style_source": style_source,
         "runtime_source": runtime_state.get("source"),
         "runtime_pack_loaded": bool(runtime_state.get("ok")),
         "runtime_pack_path": runtime_state.get("pack_path"),

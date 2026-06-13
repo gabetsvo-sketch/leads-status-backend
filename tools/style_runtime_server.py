@@ -44,6 +44,134 @@ ALLOWED_GET_RE = re.compile(
 )
 PACK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# --- Поиск похожих ситуаций (RAG) -----------------------------------------
+# numpy импортируем лениво: модуль должен грузиться и без него (тестовое окружение
+# бэкенда без numpy), а поиск просто отключается, если numpy недоступен.
+_NP = None
+
+
+def _get_np():
+    global _NP
+    if _NP is None:
+        try:
+            import numpy as _n
+            _NP = _n
+        except Exception:
+            _NP = False
+    return _NP or None
+
+
+STYLE_RETRIEVAL_DIR = Path(
+    os.environ.get("STYLE_RETRIEVAL_DIR", str(Path.home() / ".local/state/style-retrieval"))
+)
+EMBED_MODEL = os.environ.get("STYLE_EMBED_MODEL", "bge-m3")
+# Порог смысловой близости: ниже — считаем, что похожей ситуации нет (общий стиль).
+SIMILAR_MIN_SIM = float(os.environ.get("STYLE_SIMILAR_MIN_SIM", "0.60"))
+_RETRIEVAL = {"loaded": False, "vectors": None, "meta": None}
+_WORD_RE = re.compile(r"[а-яёa-z0-9]{4,}")
+
+
+def _retrieval_load() -> bool:
+    if _RETRIEVAL["loaded"]:
+        return _RETRIEVAL["vectors"] is not None
+    _RETRIEVAL["loaded"] = True
+    np = _get_np()
+    if np is None:
+        log.warning("retrieval: numpy недоступен — поиск похожих отключён")
+        return False
+    try:
+        vecs = np.load(STYLE_RETRIEVAL_DIR / "vectors.npy")
+        meta = [
+            json.loads(l)
+            for l in (STYLE_RETRIEVAL_DIR / "meta.jsonl").read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
+        if len(meta) == vecs.shape[0] and len(meta) > 0:
+            _RETRIEVAL["vectors"] = vecs.astype(np.float32)
+            _RETRIEVAL["meta"] = meta
+            log.info("retrieval: loaded %d situation->reply vectors", len(meta))
+            return True
+        log.warning("retrieval: vectors/meta size mismatch")
+    except Exception as e:
+        log.warning("retrieval: index load failed: %s", e)
+    return False
+
+
+def _retrieval_embed(text: str):
+    body = json.dumps({"model": EMBED_MODEL, "prompt": (text or "")[:1200]}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE_URL}/api/embeddings", data=body, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())["embedding"]
+
+
+def _recency_weight(ts: str) -> float:
+    try:
+        from datetime import datetime, timezone
+        d = datetime.fromisoformat((ts or "").replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - d).days
+    except Exception:
+        return 0.0
+    if age <= 90:
+        return 0.06
+    if age <= 365:
+        return 0.03
+    if age <= 730:
+        return 0.0
+    return -0.03
+
+
+def retrieval_similar(situation: str, scenario: str = "", k: int = 3) -> list:
+    """Топ-k похожих (ситуация->ответ): смысл + сценарий + свежесть + повторы + слова."""
+    if not (situation or "").strip() or not _retrieval_load():
+        return []
+    np = _get_np()
+    q = np.asarray(_retrieval_embed(situation), dtype=np.float32)
+    q = q / (np.linalg.norm(q) or 1.0)
+    vecs = _RETRIEVAL["vectors"]
+    meta = _RETRIEVAL["meta"]
+    sims = vecs @ q
+    q_words = set(_WORD_RE.findall(situation.lower()))
+    scen = (scenario or "").lower()
+    top_idx = np.argsort(-sims)[:40]
+    scored = []
+    for i in top_idx:
+        i = int(i)
+        base = float(sims[i])
+        if base < SIMILAR_MIN_SIM:
+            continue
+        m = meta[i]
+        s = base
+        if scen and scen in [str(x).lower() for x in (m.get("scenarios") or [])]:
+            s += 0.08
+        s += _recency_weight(m.get("ts") or "")
+        s += min(0.04, 0.01 * (int(m.get("repeats") or 1) - 1))
+        r_words = set(_WORD_RE.findall((m.get("situation") or "").lower()))
+        if q_words and r_words:
+            s += 0.10 * (len(q_words & r_words) / len(q_words))
+        scored.append((s, base, m))
+    scored.sort(key=lambda x: -x[0])
+    out, seen = [], set()
+    for s, base, m in scored:
+        rep = (m.get("reply") or "").strip()
+        if rep[:80] in seen:
+            continue
+        seen.add(rep[:80])
+        out.append({
+            "reply": rep,
+            "score": round(s, 3),
+            "similarity": round(base, 3),
+            "scenario": (m.get("scenarios") or [None])[0],
+            "date": (m.get("ts") or "")[:10],
+            "deal_ref": m.get("deal_id") or "",
+        })
+        if len(out) >= k:
+            break
+    return out
+
 
 class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
     server_version = "StyleRuntimeServer/1"
@@ -112,6 +240,28 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+
+        if path == "/v1/similar":
+            if not self._check_token():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length)) if length else {}
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            try:
+                results = retrieval_similar(
+                    body.get("situation") or "",
+                    body.get("scenario") or "",
+                    int(body.get("k") or 3),
+                )
+                self._send_json(200, {"ok": True, "results": results, "count": len(results)})
+            except Exception as e:
+                log.warning("similar failed: %s", e)
+                self._send_json(200, {"ok": False, "results": [], "error": str(e)[:200]})
+            return
 
         if path != "/v1/draft":
             self._send_json(404, {"error": "not found"})
@@ -228,6 +378,17 @@ class StyleRuntimeHandler(http.server.BaseHTTPRequestHandler):
             "\n".join(parts)
             + f"\n\nКанал: {channel}. Длина: {length_note}. {price_note}"
         )
+        similar = payload.get("similar_examples") or []
+        similar = [str(s).strip() for s in similar if str(s).strip()][:3]
+        if similar:
+            examples_block = "\n".join(f"- «{s}»" for s in similar)
+            user_content += (
+                "\n\nПОХОЖИЕ СИТУАЦИИ ИЗ ПРОШЛЫХ ДИАЛОГОВ ВЛАДИМИРА (как он отвечал в близких случаях):\n"
+                f"{examples_block}\n"
+                "Напиши заново в этом ключе - держись тона, структуры и заходов из этих примеров, "
+                "но адаптируй под текущую сделку и её факты. Если контекст не позволяет повторить "
+                "ход примера - не копируй его, опирайся на общий стиль. Не выдумывай факты из примеров."
+            )
         if feedback:
             user_content += (
                 "\n\n!!! ГЛАВНОЕ ТРЕБОВАНИЕ. Владимир прочитал прошлый черновик и просит "
