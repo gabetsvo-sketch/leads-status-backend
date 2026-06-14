@@ -1012,3 +1012,43 @@ def test_priority_classification_flow(app_client, widget_headers, internal_heade
     tasks = {t["task_id"]: t for t in client.get("/api/tasks/today", headers=widget_headers).json()["tasks"]}
     assert tasks[8002]["priority_tag"] == "warm"
     assert client.post("/api/internal/tasks/priority", headers=widget_headers, json={"items": []}).status_code in (401, 403)
+
+
+def test_sync_now_and_reschedule(app_client, widget_headers, internal_headers):
+    """Кнопка «Обновить» в карточке (2026-06-13): триггер сверки с CRM +
+    ручной перенос задачи обновляет срок (карточка уезжает из «сегодня»)."""
+    client, _ = app_client
+    client.post("/api/internal/tasks", headers=internal_headers, json={"tasks": [{
+        "task_id": 8100, "lead_id": 998100, "due": "2026-01-01T10:00:00+07:00",
+        "created_by": 0, "created_by_name": "system", "task_text": "Связаться",
+        "lead_name": "Тест", "phone": "", "amocrm_url": "https://example.invalid/leads/detail/998100",
+    }]})
+
+    r = client.post("/api/triggers/sync_now", headers=widget_headers)
+    assert r.status_code == 200
+    assert client.get("/api/internal/triggers/sync_now_request", headers=internal_headers).json()["requested_at"]
+
+    r = client.post("/api/internal/tasks/8100/reschedule", headers=internal_headers,
+                    json={"due": "2099-12-31T10:00:00+07:00"})
+    assert r.status_code == 200
+    task = client.get("/api/tasks/today", headers=widget_headers).json()["tasks"][0]
+    assert task["due"] == "2099-12-31T10:00:00+07:00"
+
+    # reschedule несуществующей задачи → 404; sync_now закрыт от widget
+    assert client.post("/api/internal/tasks/999/reschedule", headers=internal_headers, json={"due": "x"}).status_code == 404
+    assert client.get("/api/internal/triggers/sync_now_request", headers=widget_headers).status_code in (401, 403)
+
+
+def test_telegram_id_passthrough(app_client, widget_headers, internal_headers):
+    """Канал-фикс (2026-06-13): telegram_id доезжает до iOS для tg://user?id=."""
+    client, _ = app_client
+    client.post("/api/internal/tasks", headers=internal_headers, json={"tasks": [{
+        "task_id": 8200, "lead_id": 998200, "due": "2099-01-01T10:00:00+07:00",
+        "created_by": 0, "created_by_name": "system", "task_text": "Связаться",
+        "lead_name": "Борис", "phone": "+79990001122", "amocrm_url": "https://example.invalid/leads/detail/998200",
+        "last_message_channel": "telegram", "messengers": ["telegram", "whatsapp"],
+        "telegram_username": "", "telegram_id": "1958635626",
+    }]})
+    task = client.get("/api/tasks/today", headers=widget_headers).json()["tasks"][0]
+    assert task["telegram_id"] == "1958635626"
+    assert task["last_message_channel"] == "telegram"

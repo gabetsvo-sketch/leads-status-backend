@@ -1161,6 +1161,52 @@ async def get_refresh_request(
 RECLASSIFY_REQUEST_FILE = Path(os.environ.get("RECLASSIFY_REQUEST_FILE", "/var/data/reclassify_request.json"))
 
 
+SYNC_NOW_REQUEST_FILE = Path(os.environ.get("SYNC_NOW_REQUEST_FILE", "/var/data/sync_now_request.json"))
+
+
+@app.post("/api/triggers/sync_now")
+async def trigger_sync_now(authorization: Optional[str] = Header(default=None)):
+    """iOS «Обновить» в карточке: просит Mac немедленно свериться с amoCRM
+    (ручное закрытие/перенос задачи), чтобы карточка ушла из списка."""
+    check_token(authorization)
+    SYNC_NOW_REQUEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SYNC_NOW_REQUEST_FILE.write_text(json.dumps({"requested_at": datetime.now(timezone.utc).isoformat()}))
+    return {"status": "ok"}
+
+
+@app.get("/api/internal/triggers/sync_now_request")
+async def get_sync_now_request(authorization: Optional[str] = Header(default=None)):
+    check_internal(authorization)
+    if not SYNC_NOW_REQUEST_FILE.exists():
+        return {"requested_at": None}
+    try:
+        return json.loads(SYNC_NOW_REQUEST_FILE.read_text())
+    except Exception:
+        return {"requested_at": None}
+
+
+@app.post("/api/internal/tasks/{task_id}/reschedule")
+async def internal_task_reschedule(
+    task_id: int,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """CRM-воркер увидел, что Владимир вручную перенёс задачу в amoCRM —
+    обновляем срок задачи, чтобы карточка переехала в нужную секцию (или ушла
+    из «сегодня/просрочено», если перенос в будущее)."""
+    check_internal(authorization)
+    due = (payload.get("due") or "").strip()
+    if not due:
+        raise HTTPException(status_code=400, detail="'due' required")
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            t["due"] = due
+            save_tasks(tasks_today)
+            log.info(f"task#{task_id}: due перенесён вручную в amoCRM → {due}")
+            return {"status": "ok", "task_id": task_id, "due": due}
+    raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
+
+
 @app.post("/api/triggers/reclassify")
 async def trigger_reclassify(authorization: Optional[str] = Header(default=None)):
     """iOS просит пересобрать метки приоритета по текущим задачам."""
@@ -1575,7 +1621,7 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
                 if tz:
                     enriched.update(tz)
             return _mark_missing_contact_context(enriched)
-        for key in ("request_text", "client_city", "client_tz_offset_min", "client_tz_label", "telegram_username"):
+        for key in ("request_text", "client_city", "client_tz_offset_min", "client_tz_label", "telegram_username", "telegram_id"):
             if (enriched.get(key) is None or enriched.get(key) == "") and L.get(key) not in (None, ""):
                 enriched[key] = _clean_request_text(L.get(key)) if key == "request_text" else L.get(key)
         if (not enriched.get("phone")) and L.get("phone"):
