@@ -3342,8 +3342,38 @@ def _style_fetch_similar_sync(situation: str, scenario: str, k: int = 3) -> dict
         return {"results": []}
 
 
-def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str]:
-    """Единый prompt писателя — тот же контракт, что у Mac/Ollama style_runtime_server."""
+def _style_project_knowledge_text(payload: dict) -> str:
+    """Знание проекта из памяток (проверенные ответы Владимира на сомнения).
+    Фича 2026-06-14: движок отвечает не только КАК (стиль), но и ЧТО (по делу).
+    Mac подмешивает только памятку нужного проекта (Render к Obsidian доступа не
+    имеет). Формат payload['project_knowledge']: {project, doubts:[{doubt,answer}],
+    phrases:[...], fits:str}."""
+    pk = payload.get("project_knowledge")
+    if not isinstance(pk, dict):
+        return ""
+    lines = []
+    proj = (pk.get("project") or "").strip()
+    if proj:
+        lines.append(f"Проект: {proj}.")
+    fits = (pk.get("fits") or "").strip()
+    if fits:
+        lines.append(f"Кому подходит: {fits}")
+    doubts = [d for d in (pk.get("doubts") or []) if isinstance(d, dict) and d.get("answer")]
+    if doubts:
+        lines.append("Проверенные ответы Владимира на частые сомнения по этому проекту:")
+        for d in doubts[:8]:
+            lines.append(f"— Сомнение: {str(d.get('doubt') or '').strip()}\n  Ответ по сути: {str(d.get('answer') or '').strip()}")
+    phrases = [str(p).strip() for p in (pk.get("phrases") or []) if str(p).strip()]
+    if phrases:
+        lines.append("Удачные обороты Владимира (для тона, не копировать дословно): "
+                     + " / ".join(f"«{p}»" for p in phrases[:6]))
+    return "\n".join(lines).strip()
+
+
+def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str, str]:
+    """Единый prompt писателя — тот же контракт, что у Mac/Ollama style_runtime_server.
+    Возвращает (system_prompt, user_content, knowledge_text). knowledge_text — знание
+    проекта из памяток, отдельным кешируемым системным блоком (см. claude-писателя)."""
     channel = (payload.get("channel") or "app").lower()
     is_messenger = channel in ("whatsapp", "telegram")
     facts = payload.get("facts_available") or []
@@ -3421,33 +3451,49 @@ def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str]:
             "выдуманных фактов - эти два правила нерушимы)."
         )
     user_content += "\n\nНапиши черновик ответа Владимира. Только текст, без заголовков и пояснений."
+    knowledge_text = _style_project_knowledge_text(payload)
+    knowledge_directive = (
+        " Если ниже дан блок ЗНАНИЕ ПРОЕКТА и клиент поднял сомнение, на которое там есть "
+        "ответ — передай СУТЬ этого ответа, но СВОИМИ словами и в стиле Владимира, не вставляя "
+        "текст из памятки дословно (это живое сообщение, а не методичка)."
+        if knowledge_text else ""
+    )
     system_prompt = (
         "Ты помогаешь Владимиру — агенту по недвижимости в Пхукете — писать ответы клиентам. "
         "Используй стиль и паттерны из пака ниже: структуру, тон, типичные CTA. "
         "Не копируй фразы дословно — повторяй структуру и тон. "
         "Пиши только по-русски. Никогда не используй длинное тире (—) и среднее тире (–): "
         "только запятая, точка или короткий дефис. "
-        "Пиши только текст черновика ответа, без заголовков и пояснений.\n\n"
+        + knowledge_directive +
+        " Пиши только текст черновика ответа, без заголовков и пояснений.\n\n"
         + pack_text
     )
-    return system_prompt, user_content
+    return system_prompt, user_content, knowledge_text
 
 
 async def _style_write_draft_claude(payload: dict, pack_id: str, pack_text: str) -> str:
     """Основной писатель: Claude API. pack_text стабилен per pack — кэшируется."""
     import anthropic
     cli = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    system_prompt, user_content = _style_writer_prompts(payload, pack_text)
+    system_prompt, user_content, knowledge_text = _style_writer_prompts(payload, pack_text)
+    system_blocks = [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+    # Знание проекта — отдельным кешируемым блоком (кэш per проект, цена не растёт).
+    if knowledge_text:
+        system_blocks.append({
+            "type": "text",
+            "text": "ЗНАНИЕ ПРОЕКТА (проверенные ответы Владимира):\n" + knowledge_text,
+            "cache_control": {"type": "ephemeral"},
+        })
     resp = await cli.messages.create(
         model=STYLE_WRITER_MODEL,
         max_tokens=350,
         thinking={"type": "disabled"},
         output_config={"effort": "low"},
-        system=[{
-            "type": "text",
-            "text": system_prompt,
-            "cache_control": {"type": "ephemeral"},
-        }],
+        system=system_blocks,
         messages=[{"role": "user", "content": user_content}],
     )
     text = "".join(b.text for b in resp.content if b.type == "text")

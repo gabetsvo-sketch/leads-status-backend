@@ -120,3 +120,26 @@ def test_empty_calls_do_not_block_draft(app_client):
     assert status == "needs_context_review" and "call_transcripts" in missing
     gate = main._style_safety_gate(payload_real, "Добрый день!", "long_silence_reactivation")
     assert "missing_call_context" in gate["flags"] and gate["pass"] is False
+
+
+def test_project_knowledge_injected_into_writer_prompt(app_client):
+    """Фича памяток (2026-06-14): project_knowledge попадает в промпт писателя
+    отдельным блоком + системная инструкция «передать суть своими словами»."""
+    _, main = app_client
+    payload = {
+        "channel": "whatsapp",
+        "last_client_message_summary": "Сомневается, далеко ли от моря",
+        "project_knowledge": {
+            "project": "The Title Sierra (Банг Тао)",
+            "fits": "Инвесторам под аренду",
+            "doubts": [{"doubt": "Далеко от моря", "answer": "До пляжа Банг Тао 7 минут на байке, есть шаттл"}],
+            "phrases": ["Это рабочая инвестиция, а не просто квартира"],
+        },
+    }
+    system, user, knowledge = main._style_writer_prompts(payload, "PACK_TEXT")
+    assert "своими словами" in system.lower()
+    assert "До пляжа Банг Тао" in knowledge
+    assert "The Title Sierra" in knowledge
+    # без знания — блок пустой, директивы нет
+    s2, _, k2 = main._style_writer_prompts({"channel": "whatsapp"}, "PACK")
+    assert k2 == "" and "знание проекта" not in s2.lower()
