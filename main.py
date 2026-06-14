@@ -1253,12 +1253,17 @@ async def internal_tasks_priority(
         tag = (it.get("priority_tag") or "").strip().lower()
         if tag not in ("hot", "warm", "sleeping"):
             tag = "warm"
-        by_id[tid] = {
+        patch = {
             "priority_tag": tag,
             "priority_reason": (it.get("priority_reason") or "").strip(),
             "next_step": (it.get("next_step") or "").strip(),
             "priority_updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        # ⏸ стоп-сигнал «не писать сейчас» (фича памяток 2026-06-14)
+        if "caution" in it:
+            patch["caution"] = bool(it.get("caution"))
+            patch["caution_reason"] = (it.get("caution_reason") or "").strip()
+        by_id[tid] = patch
     updated = 0
     for bucket in ("tasks", "completed_today"):
         for t in tasks_today.get(bucket) or []:
@@ -1523,6 +1528,9 @@ async def internal_tasks(
         "priority_reason",
         "next_step",
         "priority_updated_at",
+        # Фича памяток/стоп-сигналов (2026-06-14): ⏸ «не писать сейчас».
+        "caution",
+        "caution_reason",
     )
     prior_by_id = {
         t.get("task_id"): {k: t.get(k) for k in PRESERVE_KEYS if k in t}
