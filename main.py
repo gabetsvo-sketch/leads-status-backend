@@ -883,6 +883,10 @@ async def internal_lead(
     lead_id = payload.get("lead_id")
     if not lead_id:
         raise HTTPException(status_code=400, detail="lead_id required")
+    # 2026-06-14: notify=false — добавить лид в список БЕЗ пуша/Telegram.
+    # Нужно для первичной заливки зеркала «Новый лид» (чтобы не было пачки
+    # уведомлений по уже висящим заявкам). Новые заявки идут с notify=true.
+    notify = bool(payload.get("notify", True))
 
     # Build 27: для существующего лида merge'им расширенные поля если они
     # пришли (client_tz_*, telegram_username, preferred_channel, request_text,
@@ -1004,36 +1008,37 @@ async def internal_lead(
     log.info(f"new lead #{lead_id} {entry['name']!r} from {entry['source']!r}")
 
     # Telegram DM в Saved Messages
-    try:
-        msg = (
-            f"🆕 Новый лид #{lead_id}\n"
-            f"👤 {entry['name'] or '(имя не указано)'}\n"
-            f"📞 {entry['phone'] or '—'}\n"
-            f"📍 {entry['source'] or '—'} · {entry['stage'] or ''}\n"
-            f"🔗 {entry['amocrm_url']}"
-        )
-        await client.send_message("me", msg)
-    except Exception as e:
-        log.warning(f"Telegram notify failed: {e}")
+    if notify:
+        try:
+            msg = (
+                f"🆕 Новый лид #{lead_id}\n"
+                f"👤 {entry['name'] or '(имя не указано)'}\n"
+                f"📞 {entry['phone'] or '—'}\n"
+                f"📍 {entry['source'] or '—'} · {entry['stage'] or ''}\n"
+                f"🔗 {entry['amocrm_url']}"
+            )
+            await client.send_message("me", msg)
+        except Exception as e:
+            log.warning(f"Telegram notify failed: {e}")
 
     # APNs push на iOS — мгновенное уведомление о новой заявке (build 20)
-    try:
-        push_title = "Новая заявка"
-        body_parts = []
-        if entry["name"]:
-            body_parts.append(entry["name"])
-        if entry["source"]:
-            body_parts.append(entry["source"])
-        push_body = " · ".join(body_parts) or f"Лид #{lead_id}"
-        sent_count = await send_push_to_all(
-            title=push_title,
-            body=push_body,
-            payload={"kind": "new_lead", "lead_id": lead_id},
-        )
-        if sent_count > 0:
-            log.info(f"APNS: уведомление о лиде #{lead_id} → {sent_count} устройств")
-    except Exception as e:
-        log.warning(f"APNS push failed: {e}")
+    if notify:
+        try:
+            body_parts = []
+            if entry["name"]:
+                body_parts.append(entry["name"])
+            if entry["source"]:
+                body_parts.append(entry["source"])
+            push_body = " · ".join(body_parts) or f"Лид #{lead_id}"
+            sent_count = await send_push_to_all(
+                title="Новая заявка",
+                body=push_body,
+                payload={"kind": "new_lead", "lead_id": lead_id},
+            )
+            if sent_count > 0:
+                log.info(f"APNS: уведомление о лиде #{lead_id} → {sent_count} устройств")
+        except Exception as e:
+            log.warning(f"APNS push failed: {e}")
 
     return {"status": "ok", "lead_id": lead_id, "inbox_size": len(leads_inbox)}
 

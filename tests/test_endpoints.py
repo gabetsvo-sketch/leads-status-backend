@@ -1052,3 +1052,17 @@ def test_telegram_id_passthrough(app_client, widget_headers, internal_headers):
     task = client.get("/api/tasks/today", headers=widget_headers).json()["tasks"][0]
     assert task["telegram_id"] == "1958635626"
     assert task["last_message_channel"] == "telegram"
+
+
+def test_internal_lead_notify_false_still_lists(app_client, widget_headers, internal_headers):
+    """notify=false добавляет лид в «Новые заявки» без пуша (первичная заливка зеркала)."""
+    client, _ = app_client
+    r = client.post("/api/internal/lead", headers=internal_headers,
+                    json={"lead_id": 770001, "name": "Зеркало", "source": "Новый лид", "notify": False})
+    assert r.status_code == 200 and r.json()["status"] == "ok"
+    leads = client.get("/api/leads?only_unacked=true&limit=50", headers=widget_headers).json()["leads"]
+    assert any(l["lead_id"] == 770001 for l in leads)
+    # silent_ack убирает из «Новых заявок»
+    assert client.post("/api/internal/leads/770001/silent_ack", headers=internal_headers).status_code == 200
+    leads = client.get("/api/leads?only_unacked=true&limit=50", headers=widget_headers).json()["leads"]
+    assert not any(l["lead_id"] == 770001 for l in leads)
