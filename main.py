@@ -1212,13 +1212,41 @@ async def internal_task_reschedule(
     raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
 
 
+@app.post("/api/internal/tasks/{task_id}/stage")
+async def internal_task_stage(
+    task_id: int,
+    payload: dict = Body(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """CRM-воркер сменил этап сделки в amoCRM по тапу Владимира — отражаем новый этап
+    в карточке (поле stage), чтобы карточка показывала актуальную стадию."""
+    check_internal(authorization)
+    stage = (payload.get("stage") or "").strip()
+    if not stage:
+        raise HTTPException(status_code=400, detail="'stage' required")
+    for t in tasks_today.get("tasks") or []:
+        if t.get("task_id") == task_id:
+            t["stage"] = stage
+            save_tasks(tasks_today)
+            log.info(f"task#{task_id}: этап сделки → {stage}")
+            return {"status": "ok", "task_id": task_id, "stage": stage}
+    raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
+
+
 # ---------------------------------------------------------------------------
 # CRM-действия по задачам сделки (2026-06-15): из карточки Владимир жмёт
 # «Выполнить» / «Поменять дату» напротив ЛЮБОЙ активной задачи сделки. iOS
 # кладёт действие в очередь, CRM-воркер исполняет в amoCRM (только по команде
 # Владимира). Ключ — amoCRM task_id (задача может и не быть отдельной карточкой).
 # ---------------------------------------------------------------------------
+# «Закрыто и не реализовано» — id статуса одинаков во всех воронках amoCRM;
+# именно он требует причину отказа (loss_reason). 142 = «Успешно реализовано».
+STATUS_CLOSED_BAD = int(os.environ.get("STATUS_CLOSED_BAD", "143"))
+
 CRM_ACTIONS_FILE = Path(os.environ.get("CRM_ACTIONS_FILE", "/var/data/crm_actions.json"))
+# Каталог воронок/этапов/причин отказа из amoCRM (Render к CRM доступа НЕ имеет —
+# Mac пушит сюда; iOS читает, чтобы показать выпадающий список статусов как в CRM).
+CRM_CATALOG_FILE = Path(os.environ.get("CRM_CATALOG_FILE", "/var/data/crm_catalog.json"))
 
 
 def _load_crm_actions() -> list:
@@ -1240,21 +1268,42 @@ async def post_crm_action(payload: dict = Body(...), authorization: Optional[str
     """iOS: «Выполнить» (complete) / «Поменять дату» (reschedule) по задаче сделки.
     {crm_task_id, lead_id?, action, due?(ISO для reschedule), label?}."""
     check_token(authorization)
-    try:
-        crm_task_id = int(payload.get("crm_task_id"))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="crm_task_id required (int)")
     action = (payload.get("action") or "").strip()
-    if action not in ("complete", "reschedule"):
-        raise HTTPException(status_code=400, detail="action must be complete|reschedule")
+    if action not in ("complete", "reschedule", "change_status"):
+        raise HTTPException(status_code=400, detail="action must be complete|reschedule|change_status")
+    # crm_task_id обязателен для задачных действий; для смены статуса сделки — НЕ нужен
+    # (это действие по lead_id, задачи может не быть).
+    crm_task_id = 0
+    if action in ("complete", "reschedule"):
+        try:
+            crm_task_id = int(payload.get("crm_task_id"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="crm_task_id required (int)")
     due = (payload.get("due") or "").strip()
     if action == "reschedule" and not due:
         raise HTTPException(status_code=400, detail="due required for reschedule")
+    status_id = pipeline_id = loss_reason_id = None
+    if action == "change_status":
+        try:
+            lead_id_int = int(payload.get("lead_id"))
+            status_id = int(payload.get("status_id"))
+            pipeline_id = int(payload.get("pipeline_id"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="lead_id, status_id, pipeline_id required (int) for change_status")
+        # «Закрыто и не реализовано» (142=успех, 143=отказ) — для отказа нужна причина.
+        if status_id == STATUS_CLOSED_BAD and payload.get("loss_reason_id") in (None, ""):
+            raise HTTPException(status_code=400, detail="loss_reason_id required for «Закрыто и не реализовано»")
+        if payload.get("loss_reason_id") not in (None, ""):
+            try:
+                loss_reason_id = int(payload.get("loss_reason_id"))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="loss_reason_id must be int")
     items = _load_crm_actions()
     aid = f"crmact-{int(datetime.now(timezone.utc).timestamp()*1000)}"
     items.append({
         "id": aid, "crm_task_id": crm_task_id,
         "lead_id": payload.get("lead_id"), "action": action, "due": due,
+        "status_id": status_id, "pipeline_id": pipeline_id, "loss_reason_id": loss_reason_id,
         "label": (payload.get("label") or "")[:200],
         "status": "pending", "created_at": datetime.now(timezone.utc).isoformat(),
         "result": None,
@@ -1291,6 +1340,32 @@ async def crm_action_done(action_id: str, payload: dict = Body(default={}),
             _save_crm_actions(items)
             return {"status": "ok"}
     raise HTTPException(status_code=404, detail="action not found")
+
+
+@app.post("/api/internal/crm_catalog")
+async def post_crm_catalog(payload: dict = Body(...), authorization: Optional[str] = Header(default=None)):
+    """Mac пушит каталог воронок/этапов/причин отказа из amoCRM (Render к CRM не имеет
+    доступа). Формат: {pipelines:[{id,name,is_main,statuses:[{id,name,type}]}], loss_reasons:[{id,name}]}."""
+    check_internal(authorization)
+    if not isinstance(payload.get("pipelines"), list):
+        raise HTTPException(status_code=400, detail="pipelines must be a list")
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    CRM_CATALOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CRM_CATALOG_FILE.write_text(json.dumps(payload, ensure_ascii=False))
+    return {"status": "ok", "pipelines": len(payload.get("pipelines") or []),
+            "loss_reasons": len(payload.get("loss_reasons") or [])}
+
+
+@app.get("/api/crm/catalog")
+async def get_crm_catalog(authorization: Optional[str] = Header(default=None)):
+    """iOS читает каталог для выпадающего списка статусов сделки и причин отказа."""
+    check_token(authorization)
+    if not CRM_CATALOG_FILE.exists():
+        return {"pipelines": [], "loss_reasons": [], "updated_at": None}
+    try:
+        return json.loads(CRM_CATALOG_FILE.read_text())
+    except Exception:
+        return {"pipelines": [], "loss_reasons": [], "updated_at": None}
 
 
 @app.post("/api/triggers/reclassify")

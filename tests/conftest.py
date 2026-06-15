@@ -45,6 +45,7 @@ def _set_test_env(tmp_path: Path) -> None:
     os.environ["DRAFT_FEEDBACK_LOG"] = str(tmp_path / "draft_feedback_log.jsonl")
     os.environ["STYLE_RUNTIME_FEEDBACK_FILE"] = str(tmp_path / "style_runtime_feedback.jsonl")
     os.environ["CRM_ACTIONS_FILE"] = str(tmp_path / "crm_actions.json")
+    os.environ["CRM_CATALOG_FILE"] = str(tmp_path / "crm_catalog.json")
     os.environ["SENT_EVENTS_FILE"] = str(tmp_path / "sent_events.jsonl")
     os.environ["RECLASSIFY_REQUEST_FILE"] = str(tmp_path / "reclassify_request.json")
     os.environ["SYNC_NOW_REQUEST_FILE"] = str(tmp_path / "sync_now_request.json")
