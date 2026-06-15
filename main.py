@@ -1734,6 +1734,9 @@ async def internal_tasks(
         # Этап 2 «Улучшайзера»: знания на карточке — какая памятка и что обещано клиенту.
         "project_memo_key",
         "promise",
+        # Структурный фикс «нет переписки»: воркер-обогатитель проставляет, есть ли
+        # реальная переписка; переживает полный пуш tasks-воркера.
+        "has_correspondence",
     )
     # Мягкое сохранение (2026-06-15, дыра «пустых карточек»): уже сгенерированный
     # черновик и его контекст НЕ должны теряться при полном пуше задач без черновика
@@ -1921,6 +1924,15 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
                 "и обнови контакт — отправить из приложения нечем."
             )
             enriched["send_blocked"] = True
+        # 5) «нет переписки» — ТОЛЬКО когда переписки реально нет. Если контекст ещё не
+        #    обогатили (пусто), но переписка ЕСТЬ (has_correspondence True/неизвестно) —
+        #    на ВЫДАЧЕ показываем «подтягиваю переписку…», чтобы iOS не писал ложное «нет
+        #    переписки» в окне до обогащения. has_correspondence=False (воркер проверил и
+        #    переписки нет) → контекст оставляем пустым, iOS честно скажет «нет переписки».
+        #    Это read-only: в сторе context_summary не меняем (SOFT_PRESERVE цел).
+        if not (enriched.get("context_summary") or "").strip():
+            if enriched.get("has_correspondence") is not False:
+                enriched["context_summary"] = "⏳ Подтягиваю переписку из CRM, контекст вот-вот появится…"
         return enriched
     enriched_tasks = [_enrich(t) for t in (tasks_today.get("tasks") or [])]
     enriched_completed = [_enrich(t) for t in (tasks_today.get("completed_today") or [])]
@@ -2449,6 +2461,11 @@ async def task_regenerated(
             ss = payload.get("style_source")
             if ss is not None:
                 t["style_source"] = ss
+            # has_correspondence: воркер-обогатитель сообщает, есть ли РЕАЛЬНАЯ переписка
+            # (true — заполнили контекст; false — проверили, переписки нет). iOS покажет
+            # «нет переписки» только при явном false, а не при пустом контексте.
+            if "has_correspondence" in payload:
+                t["has_correspondence"] = bool(payload["has_correspondence"])
             t["needs_regen"] = False
             t.pop("regen_feedback", None)
             t["regen_completed_at"] = datetime.now(timezone.utc).isoformat()

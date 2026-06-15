@@ -84,3 +84,33 @@ def test_cta_word_boundary_no_false_block(app_client):
     assert main._style_count_cta("Марина, подскажите, когда удобно? Актуально ещё?") <= 2
     # реальный перегруз призывами по-прежнему ловится
     assert main._style_count_cta("Как вы? Что решили? Когда созвон? Напишите!") > 2
+
+
+def test_no_correspondence_placeholder_when_unknown(app_client, internal_headers, widget_headers):
+    """Пустой контекст + has_correspondence неизвестно → на ВЫДАЧЕ плейсхолдер
+    «подтягиваю переписку», а НЕ ложное «нет переписки» (фикс рецидива 2026-06-15)."""
+    client, _ = app_client
+    _push(client, internal_headers, {"task_id": 95001, "lead_name": "Жанна", "stage": "В работе",
+                                      "suggested_message": "Жанна, добрый день."})
+    c = _get_card(client, widget_headers, 95001)
+    assert c["context_summary"].startswith("⏳")   # плейсхолдер, не пусто
+
+
+def test_no_correspondence_honest_when_false(app_client, internal_headers, widget_headers):
+    """has_correspondence=False (воркер проверил, переписки нет) → контекст пуст,
+    iOS честно покажет «нет переписки»."""
+    client, _ = app_client
+    _push(client, internal_headers, {"task_id": 95002, "lead_name": "Без диалога", "stage": "В работе",
+                                      "suggested_message": "Добрый день.", "has_correspondence": False})
+    c = _get_card(client, widget_headers, 95002)
+    assert (c.get("context_summary") or "") == ""   # пусто → iOS «нет переписки»
+
+
+def test_real_context_not_overwritten_by_placeholder(app_client, internal_headers, widget_headers):
+    """Реальный контекст показывается как есть (плейсхолдер не подменяет)."""
+    client, _ = app_client
+    _push(client, internal_headers, {"task_id": 95003, "lead_name": "Марина", "stage": "В работе",
+                                      "suggested_message": "Марина, добрый день.",
+                                      "context_summary": "Смотрели Камалу, нужна продажа квартиры в РФ."})
+    c = _get_card(client, widget_headers, 95003)
+    assert c["context_summary"] == "Смотрели Камалу, нужна продажа квартиры в РФ."
