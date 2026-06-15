@@ -1066,3 +1066,29 @@ def test_internal_lead_notify_false_still_lists(app_client, widget_headers, inte
     assert client.post("/api/internal/leads/770001/silent_ack", headers=internal_headers).status_code == 200
     leads = client.get("/api/leads?only_unacked=true&limit=50", headers=widget_headers).json()["leads"]
     assert not any(l["lead_id"] == 770001 for l in leads)
+
+
+def test_full_push_does_not_wipe_existing_draft(app_client, widget_headers, internal_headers):
+    """Дыра «пустых карточек» (аудит 2026-06-15): полный пуш задач БЕЗ черновика
+    не должен стирать уже сгенерированный suggested_message."""
+    client, _ = app_client
+
+    def _task(tid, draft=""):
+        t = {"task_id": tid, "lead_id": 770000 + tid, "due": "2099-01-01T10:00:00+07:00",
+             "created_by": 0, "created_by_name": "system", "task_text": "Связаться",
+             "lead_name": "Клиент 1234", "phone": "", "amocrm_url": f"https://example.invalid/leads/detail/{770000+tid}"}
+        if draft:
+            t["suggested_message"] = draft
+        return t
+
+    # 1) задача с черновиком
+    client.post("/api/internal/tasks", headers=internal_headers, json={"tasks": [_task(7700, draft="Готовый черновик от движка")]})
+    # 2) полный пуш БЕЗ черновика (как тестовая загрузка)
+    client.post("/api/internal/tasks", headers=internal_headers, json={"tasks": [_task(7700)]})
+    task = client.get("/api/tasks/today", headers=widget_headers).json()["tasks"][0]
+    assert task["suggested_message"] == "Готовый черновик от движка", "полный пуш стёр готовый черновик!"
+
+    # 3) пуш С НОВЫМ непустым черновиком — он должен победить (легитимное обновление)
+    client.post("/api/internal/tasks", headers=internal_headers, json={"tasks": [_task(7700, draft="Новый текст")]})
+    task = client.get("/api/tasks/today", headers=widget_headers).json()["tasks"][0]
+    assert task["suggested_message"] == "Новый текст"

@@ -1532,23 +1532,45 @@ async def internal_tasks(
         "caution",
         "caution_reason",
     )
+    # Мягкое сохранение (2026-06-15, дыра «пустых карточек»): уже сгенерированный
+    # черновик и его контекст НЕ должны теряться при полном пуше задач без черновика
+    # (тестовая загрузка / снимок воркера). Черновик меняется только через
+    # /regenerated; полный пуш его никогда не стирает. Если новый payload принёс
+    # НЕПУСТОЙ черновик — он побеждает (легитимное обновление).
+    SOFT_PRESERVE_IF_EMPTY = (
+        "suggested_message", "rationale", "context_summary",
+        "style_runtime_pack_id", "style_source", "variants",
+    )
     prior_by_id = {
-        t.get("task_id"): {k: t.get(k) for k in PRESERVE_KEYS if k in t}
+        t.get("task_id"): {k: t.get(k) for k in (tuple(PRESERVE_KEYS) + SOFT_PRESERVE_IF_EMPTY) if k in t}
         for t in (tasks_today.get("tasks") or [])
         if t.get("task_id") is not None
     }
+
+    def _is_empty(v):
+        if v is None:
+            return True
+        if isinstance(v, str):
+            return not v.strip()
+        if isinstance(v, (list, dict)):
+            return len(v) == 0
+        return False
 
     merged = []
     for raw_t in tasks:
         t = normalize_client_timezone_payload(raw_t)
         tid = t.get("task_id")
         prior = prior_by_id.get(tid) or {}
-        # Если scheduler сам перегенерил suggested_message (regen worker), то
-        # эти поля придут в новом payload — оставляем новые. Но user-action
-        # поля (action_state, pending_send) — preserve.
-        for k, v in prior.items():
+        # user-state поля (action_state/pending_send/приоритет/⏸ и т.д.): заполняем,
+        # если в новом payload их нет.
+        for k in PRESERVE_KEYS:
+            v = prior.get(k)
             if v is not None and k not in t:
                 t[k] = v
+        # черновик и контекст: если новый пуст, а раньше был — ВЕРНУТЬ старый.
+        for k in SOFT_PRESERVE_IF_EMPTY:
+            if _is_empty(t.get(k)) and not _is_empty(prior.get(k)):
+                t[k] = prior[k]
         merged.append(t)
 
     tasks_today = {
