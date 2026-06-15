@@ -1247,6 +1247,10 @@ CRM_ACTIONS_FILE = Path(os.environ.get("CRM_ACTIONS_FILE", "/var/data/crm_action
 # Каталог воронок/этапов/причин отказа из amoCRM (Render к CRM доступа НЕ имеет —
 # Mac пушит сюда; iOS читает, чтобы показать выпадающий список статусов как в CRM).
 CRM_CATALOG_FILE = Path(os.environ.get("CRM_CATALOG_FILE", "/var/data/crm_catalog.json"))
+# Памятки по проектам для экрана памятки в приложении (Этап 2 «Улучшайзера»). Mac
+# собирает из Obsidian (15 памяток: кому подходит/сомнения→ответы/фразы/чем заменить/
+# дата проверки цен) и пушит; Render к Obsidian доступа НЕ имеет.
+KNOWLEDGE_MEMOS_FILE = Path(os.environ.get("KNOWLEDGE_MEMOS_FILE", "/var/data/knowledge_memos.json"))
 
 
 def _load_crm_actions() -> list:
@@ -1366,6 +1370,46 @@ async def get_crm_catalog(authorization: Optional[str] = Header(default=None)):
         return json.loads(CRM_CATALOG_FILE.read_text())
     except Exception:
         return {"pipelines": [], "loss_reasons": [], "updated_at": None}
+
+
+def _load_memos() -> dict:
+    if not KNOWLEDGE_MEMOS_FILE.exists():
+        return {}
+    try:
+        return json.loads(KNOWLEDGE_MEMOS_FILE.read_text()).get("memos") or {}
+    except Exception:
+        return {}
+
+
+@app.post("/api/internal/knowledge/memos")
+async def post_knowledge_memos(payload: dict = Body(...), authorization: Optional[str] = Header(default=None)):
+    """Mac пушит памятки по проектам (Этап 2). Формат: {memos: {<key>: {name, fits,
+    doubts:[{doubt,answer}], phrases:[], alternatives:[{when,target}], prices_verified, obsidian_uri}}}."""
+    check_internal(authorization)
+    if not isinstance(payload.get("memos"), dict):
+        raise HTTPException(status_code=400, detail="memos must be an object")
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    KNOWLEDGE_MEMOS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    KNOWLEDGE_MEMOS_FILE.write_text(json.dumps(payload, ensure_ascii=False))
+    return {"status": "ok", "memos": len(payload.get("memos") or {})}
+
+
+@app.get("/api/memos")
+async def get_memos_list(authorization: Optional[str] = Header(default=None)):
+    """iOS: список памяток (ключ + название) для раздела «Памятки» и кнопок на карточке."""
+    check_token(authorization)
+    memos = _load_memos()
+    return {"memos": [{"key": k, "name": (v or {}).get("name") or k} for k, v in memos.items()]}
+
+
+@app.get("/api/memo/{key:path}")
+async def get_memo(key: str, authorization: Optional[str] = Header(default=None)):
+    """iOS: одна памятка по ключу для экрана памятки."""
+    check_token(authorization)
+    memo = _load_memos().get(key)
+    if not memo:
+        raise HTTPException(status_code=404, detail="memo not found")
+    return {"key": key, **memo}
 
 
 @app.post("/api/triggers/reclassify")
@@ -1687,6 +1731,9 @@ async def internal_tasks(
         # Фича памяток/стоп-сигналов (2026-06-14): ⏸ «не писать сейчас».
         "caution",
         "caution_reason",
+        # Этап 2 «Улучшайзера»: знания на карточке — какая памятка и что обещано клиенту.
+        "project_memo_key",
+        "promise",
     )
     # Мягкое сохранение (2026-06-15, дыра «пустых карточек»): уже сгенерированный
     # черновик и его контекст НЕ должны теряться при полном пуше задач без черновика
