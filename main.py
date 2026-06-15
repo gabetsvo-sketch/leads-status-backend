@@ -1721,10 +1721,21 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
             )
         return enriched
 
+    def _infer_channel_from_card(c: dict) -> str:
+        """Канал из полей самой задачи (без leads_inbox): сначала telegram, иначе phone→whatsapp."""
+        if c.get("telegram_username") or c.get("telegram_id"):
+            return "telegram"
+        if c.get("phone") or c.get("whatsapp_phone"):
+            return "whatsapp"
+        return ""
+
     def _enrich(t: dict) -> dict:
-        enriched = dict(t)
-        # Подсказка «ответить голосовым» (урок из выигранных сделок): считаем из
-        # контекста задачи. Это про канал, текст не трогаем — iOS показывает намёк.
+        # Нормализуем поля на ЧТЕНИИ (для ЛЮБОГО продюсера и пути записи): @ник в
+        # phone → telegram_username, числовая стадия → '', формат телефона. Раньше это
+        # было только на ingest, поэтому у Ольги '@olgabondarenko27' доезжал до iOS и
+        # давал битый wa.me/27 (баг, аудит 2026-06-15).
+        enriched = _style_normalize_card_fields(dict(t))
+        # Подсказка «ответить голосовым» (урок из выигранных сделок): про канал, текст не трогаем.
         enriched["voice_suggested"] = _style_voice_suggested(
             enriched.get("style_runtime_pack_id") or "",
             {"last_client_message_summary": enriched.get("context_summary"),
@@ -1733,61 +1744,61 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
         )
         if enriched.get("request_text"):
             enriched["request_text"] = _clean_request_text(enriched["request_text"])
-        # Инцидент 2026-06-12: строка вместо объекта в last_significant_contact
-        # ломала decode ВСЕГО списка в iOS — приложение молча показывало старый
-        # кэш. Сервер нормализует формат, чтобы один кривой продюсер карточек
-        # не оставил Владимира на устаревших данных.
+        # Инцидент 2026-06-12: строка вместо объекта в last_significant_contact ломала
+        # decode ВСЕГО списка в iOS. Нормализуем формат.
         lsc = enriched.get("last_significant_contact")
         if isinstance(lsc, str):
             enriched["last_significant_contact"] = {"date": lsc, "channel": None, "meaning": None}
+        # Обогащение из leads_inbox, ЕСЛИ лид там есть (контакт/tz/канал по заявке).
         lid = enriched.get("lead_id")
-        if not lid:
-            if enriched.get("client_tz_offset_min") is None and not enriched.get("client_tz_label"):
-                tz = _resolve_tz_from_phone(enriched.get("phone") or enriched.get("whatsapp_phone"))
-                if tz:
-                    enriched.update(tz)
-            return _mark_missing_contact_context(enriched)
-        L = leads_by_id.get(lid)
-        if not L:
-            if enriched.get("client_tz_offset_min") is None and not enriched.get("client_tz_label"):
-                tz = _resolve_tz_from_phone(enriched.get("phone") or enriched.get("whatsapp_phone"))
-                if tz:
-                    enriched.update(tz)
-            return _mark_missing_contact_context(enriched)
-        for key in ("request_text", "client_city", "client_tz_offset_min", "client_tz_label", "telegram_username", "telegram_id"):
-            if (enriched.get(key) is None or enriched.get(key) == "") and L.get(key) not in (None, ""):
-                enriched[key] = _clean_request_text(L.get(key)) if key == "request_text" else L.get(key)
-        if (not enriched.get("phone")) and L.get("phone"):
-            enriched["phone"] = L.get("phone")
-        if (not enriched.get("whatsapp_phone")) and (L.get("whatsapp_phone") or L.get("phone")):
-            enriched["whatsapp_phone"] = L.get("whatsapp_phone") or L.get("phone")
+        L = leads_by_id.get(lid) if lid else None
+        if L:
+            for key in ("request_text", "client_city", "client_tz_offset_min", "client_tz_label", "telegram_username", "telegram_id"):
+                if (enriched.get(key) is None or enriched.get(key) == "") and L.get(key) not in (None, ""):
+                    enriched[key] = _clean_request_text(L.get(key)) if key == "request_text" else L.get(key)
+            if (not enriched.get("phone")) and L.get("phone"):
+                enriched["phone"] = L.get("phone")
+            if (not enriched.get("whatsapp_phone")) and (L.get("whatsapp_phone") or L.get("phone")):
+                enriched["whatsapp_phone"] = L.get("whatsapp_phone") or L.get("phone")
+            lead_channel = _infer_channel_from_lead(L)
+            if lead_channel and not enriched.get("last_message_channel"):
+                enriched["last_message_channel"] = lead_channel
+                enriched.setdefault("last_incoming_channel", lead_channel)
+            enriched = _style_normalize_card_fields(enriched)  # leads_inbox мог принести @phone
+        # ЕДИНЫЙ хвост (выполняется ВСЕГДА, в т.ч. для task-only карточек без лида в inbox):
+        # 1) канал из собственных полей задачи, если ещё не выведен (фикс «8 карточек без канала»);
+        if not enriched.get("last_message_channel") and not (enriched.get("messengers") or []):
+            ch = _infer_channel_from_card(enriched)
+            if ch:
+                enriched["last_message_channel"] = ch
+                enriched.setdefault("last_incoming_channel", ch)
+        # 2) messengers из реально доступных контактов (бейдж канала в шапке);
+        msgrs = list(enriched.get("messengers") or [])
+        if (enriched.get("telegram_username") or enriched.get("telegram_id")) and "telegram" not in msgrs:
+            msgrs.append("telegram")
+        if (enriched.get("phone") or enriched.get("whatsapp_phone")) and "whatsapp" not in msgrs:
+            msgrs.append("whatsapp")
+        if msgrs:
+            enriched["messengers"] = msgrs
+        # 3) часовой пояс из телефона, если не задан;
         if enriched.get("client_tz_offset_min") is None and not enriched.get("client_tz_label"):
-            tz = _resolve_tz_from_phone(enriched.get("phone") or enriched.get("whatsapp_phone") or L.get("phone"))
+            tz = _resolve_tz_from_phone(enriched.get("phone") or enriched.get("whatsapp_phone"))
             if tz:
                 enriched.update(tz)
-        channel = _infer_channel_from_lead(L)
-        if channel:
-            if not enriched.get("last_message_channel"):
-                enriched["last_message_channel"] = channel
-            if not enriched.get("last_incoming_channel"):
-                enriched["last_incoming_channel"] = channel
-            messengers = enriched.get("messengers") or []
-            if channel not in messengers:
-                enriched["messengers"] = [*messengers, channel]
-        has_contact = any(enriched.get(k) for k in ("phone", "whatsapp_phone", "telegram_username", "telegram", "whatsapp"))
-        has_channel = bool(enriched.get("messengers") or enriched.get("last_message_channel") or enriched.get("last_incoming_channel"))
-        has_tz = enriched.get("client_tz_offset_min") is not None or bool(enriched.get("client_tz_label"))
-        if not (has_contact or has_channel or has_tz):
-            enriched.setdefault("contact_lookup_status", "contact_missing")
-            enriched.setdefault(
-                "contact_action_blocker",
-                "Контакт/мессенджер не подтянут. Открой AmoCRM и обнови sync перед отправкой.",
+        # 4) статус контакта по ФАКТУ: есть контакт → снять ложный блокер; нет → честный блокер
+        #    (фикс «ложный contact_missing при наличии телефона» + явный send_blocked).
+        has_contact = any(enriched.get(k) for k in ("phone", "whatsapp_phone", "telegram_username", "telegram_id"))
+        if has_contact:
+            enriched.pop("contact_lookup_status", None)
+            enriched.pop("contact_action_blocker", None)
+            enriched["send_blocked"] = False
+        else:
+            enriched["contact_lookup_status"] = "contact_missing"
+            enriched["contact_action_blocker"] = (
+                "Контактов клиента в карточке нет (телефон/Telegram). Открой сделку в AmoCRM "
+                "и обнови контакт — отправить из приложения нечем."
             )
-        # Safety gate (2026-05-15): do NOT fill task-specific suggested_message
-        # from new-lead timer_3min_text. That timer text is an emergency first-touch
-        # fallback and is not grounded in the task's CRM chat history / Message KB.
-        # If scheduler could not generate a task draft, iOS must show an empty draft
-        # and the operator must inspect/regenerate instead of seeing a generic text.
+            enriched["send_blocked"] = True
         return enriched
     enriched_tasks = [_enrich(t) for t in (tasks_today.get("tasks") or [])]
     enriched_completed = [_enrich(t) for t in (tasks_today.get("completed_today") or [])]
@@ -3188,7 +3199,14 @@ def _style_choose_pack(payload: dict) -> tuple[str, list[str], str]:
 def _style_count_cta(text: str) -> int:
     if not text:
         return 0
-    return min(text.count("?") + sum(1 for marker in ("напишите", "скажи", "скажите", "удобно") if marker in text.lower()), 3)
+    low = text.lower().replace("ё", "е")
+    q = low.count("?")
+    # Маркеры-призывы — по ГРАНИЦЕ слова, иначе «скажите» матчило «подскажите», а
+    # «удобно» — «неудобно», и нормальный вежливый черновик с 2 вопросами ложно
+    # блокировался как too_many_cta → пустая карточка (баг, аудит 2026-06-15).
+    markers = ("напишите", "сообщите", "перезвоните", "ответьте", "дайте знать", "жду ответа")
+    m = sum(1 for mk in markers if re.search(rf"(?<![а-я]){re.escape(mk)}(?![а-я])", low))
+    return min(q + m, 5)
 
 
 _STYLE_MEMORY_EXAMPLE_TYPES = {"phrase_pattern", "full_structure", "start", "cta", "tone", "micro_pattern", "style_feature"}
@@ -3563,9 +3581,20 @@ def _style_normalize_card_fields(t: dict) -> dict:
         t["stage"] = ""  # iOS скрывает пустую стадию (лучше пусто, чем числовой код)
     for pkey in ("phone", "whatsapp_phone"):
         val = str(t.get(pkey) or "").strip()
+        if not val:
+            continue
         if val.startswith("@"):
             t.setdefault("telegram_username", val.lstrip("@"))
             t[pkey] = ""  # @username — это телеграм-ник, не телефон
+        elif re.search(r"[A-Za-zА-Яа-яЁё]", val):
+            t[pkey] = ""  # буквы в поле телефона = мусор (напр. ник без @)
+        else:
+            # формат телефона: только + и цифры (убрать пробелы/скобки/дефисы),
+            # иначе ломается tel:/onlinepbx/поиск дубликатов (напр. «+7 915 090 2237»).
+            cleaned = re.sub(r"[^\d+]", "", val)
+            if "+" in cleaned:
+                cleaned = "+" + cleaned.replace("+", "")
+            t[pkey] = cleaned if cleaned.lstrip("+") else ""
     return t
 # --------------------------------------------------------------------------------
 
