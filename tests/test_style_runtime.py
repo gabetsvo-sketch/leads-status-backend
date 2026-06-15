@@ -204,7 +204,12 @@ def test_style_runtime_transferred_author_confusion_is_hard_block(app_client, of
     assert "unsupported_continuity_claim" in body["safety_flags"]
 
 
-def test_style_runtime_blocks_ai_dash_in_client_draft(app_client, office_headers, monkeypatch):
+def test_style_runtime_normalizes_ai_dash_in_client_draft(app_client, office_headers, monkeypatch):
+    """Тире от писателя (часто от Mac/Ollama-фолбэка) теперь НЕ блокирует карточку в
+    пустоту, а чинится (запятая/дефис) до гейта — иначе тире детерминированно делало
+    карточку пустой (одна из причин рецидива «пустых карточек», аудит 2026-06-15).
+    Инвариант Владимира сохранён: длинного/среднего тире в тексте клиенту нет; и
+    по-прежнему никаких авто-отправок/записей в CRM."""
     client, main = app_client
 
     async def bad_writer(payload, pack_id, pack_text=""):
@@ -224,9 +229,11 @@ def test_style_runtime_blocks_ai_dash_in_client_draft(app_client, office_headers
 
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["safety_pass"] is False
-    assert body["draft_text"] == ""
-    assert "ai_dash_detected" in body["safety_flags"]
+    # тире вычищено — текст дошёл до карточки чистым, а не обнулился
+    assert body["draft_text"]
+    assert "—" not in body["draft_text"] and "–" not in body["draft_text"]
+    assert "ai_dash_detected" not in body["safety_flags"]
+    # безопасность: ничего не отправлено и в CRM не записано
     assert body["send_performed"] is False
     assert body["crm_mutated"] is False
 

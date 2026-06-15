@@ -1640,6 +1640,9 @@ async def internal_tasks(
     merged = []
     for raw_t in tasks:
         t = normalize_client_timezone_payload(raw_t)
+        # Барьер входных полей: битая стадия (числовой ID/None) и @username в phone
+        # не доезжают до карточки, от какого бы продюсера ни пришёл пуш.
+        t = _style_normalize_card_fields(t)
         tid = t.get("task_id")
         prior = prior_by_id.get(tid) or {}
         # user-state поля (action_state/pending_send/приоритет/⏸ и т.д.): заполняем,
@@ -1652,6 +1655,12 @@ async def internal_tasks(
         for k in SOFT_PRESERVE_IF_EMPTY:
             if _is_empty(t.get(k)) and not _is_empty(prior.get(k)):
                 t[k] = prior[k]
+        # Заглушка обращения не должна пережить пуш: чистим черновик (свой или
+        # сохранённый старый) по АКТУАЛЬНОМУ имени из lead_name. Закрывает гонку
+        # «черновик сгенерён до того, как reformat проставил имя» (кейс Ольги).
+        sm = t.get("suggested_message")
+        if isinstance(sm, str) and sm.strip():
+            t["suggested_message"] = sanitize_outgoing_draft(sm, _style_name_from_lead_name(t.get("lead_name")))
         merged.append(t)
 
     tasks_today = {
@@ -2295,6 +2304,10 @@ async def task_regenerated(
     for t in tasks_today.get("tasks") or []:
         if t.get("task_id") == task_id:
             if sug:
+                # Прямой путь Mac/Ollama в карточку шёл в обход нормализатора писателя —
+                # чистим заглушку обращения и здесь (имя из payload или из lead_name).
+                cn = payload.get("client_name") or _style_name_from_lead_name(t.get("lead_name"))
+                sug = sanitize_outgoing_draft(sug, cn)
                 t["suggested_message"] = sug
             if rat:
                 t["rationale"] = rat
@@ -3356,6 +3369,11 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
     flags.extend(_style_memory_guard_flags(draft_text, style_memory or {}))
     if _style_text_has_pii(draft_text):
         flags.append("pii_detected")
+    # Протёкшая заглушка обращения «Имя»/«[Имя]»/«{name}» (из обезличенных примеров
+    # пака) — никогда не показывать клиенту как готовый текст. Санитайзер уже подставил
+    # реальное имя в вокатив; если что-то осталось (скобки/имя в середине) — hard-блок.
+    if _style_has_name_placeholder(draft_text):
+        flags.append("name_placeholder")
 
     if payload.get("dialogue_transferred") or snapshot.get("dialogue_transferred"):
         draft_lower = (draft_text or "").lower()
@@ -3376,6 +3394,7 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
         "price_without_source", "pii_detected", "too_many_cta", "missing_call_context",
         "author_confusion", "unsupported_continuity_claim", "not_actual_client_ignored",
         "ai_dash_detected", "internal_style_meta_phrase", "style_memory_contraindication",
+        "name_placeholder",
     }
     flags = list(dict.fromkeys(flags))
     missing = list(dict.fromkeys(missing))
@@ -3386,6 +3405,8 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
         block_reason = "Черновик похож на AI-текст или содержит внутреннюю формулировку. Нужна ручная правка вместо показа как готового сообщения."
     elif "style_memory_contraindication" in flags:
         block_reason = "Черновик нарушает approved Style Memory contraindication. Нужна ручная правка вместо показа как готового сообщения."
+    elif "name_placeholder" in flags:
+        block_reason = "В черновике осталась заглушка обращения («Имя»/«[Имя]»). Подставьте настоящее имя клиента вручную перед отправкой."
     else:
         block_reason = None if safety_pass else "Нельзя показывать как готовый черновик: не хватает подтверждённых фактов или есть safety-флаг."
     return {
@@ -3407,6 +3428,9 @@ _STYLE_RETRYABLE_FLAGS = {
     "not_actual_client_ignored", "stale_timeline_overrides_recent_call",
     "author_confusion", "unsupported_continuity_claim",
     "style_memory_contraindication", "pii_detected",
+    # заглушку имени стоит сначала перегенерировать (директива про имя усилена),
+    # и только если протекает раз за разом — блокировать (hard_block_flags выше).
+    "name_placeholder",
 }
 
 
@@ -3418,8 +3442,14 @@ async def _style_generate_with_retries(
     are not retried: the writer cannot fix them."""
     draft_text = ""
     safety: dict = {}
+    client_name = payload.get("client_name") or ""
     for attempt in range(1, attempts + 1):
         draft_text = await _style_write_draft(payload, pack_id, pack_text=pack_text)
+        # Единый чокпоинт для ОБОИХ путей писателя (Claude и Mac/Ollama): снять тире и
+        # вычистить протёкшую заглушку обращения «Имя» до проверки гейтом. Гейт затем
+        # ловит остаточную заглушку (name_placeholder) и перепроверяет PII по тексту.
+        draft_text = _style_normalize_client_text(draft_text)
+        draft_text = sanitize_outgoing_draft(draft_text, client_name)
         safety = _style_safety_gate(payload, draft_text, pack_id, style_memory=style_memory)
         if safety["pass"] and draft_text:
             return draft_text, safety
@@ -3439,6 +3469,105 @@ STYLE_WRITER_MODEL = os.environ.get("STYLE_WRITER_MODEL", "claude-sonnet-4-6").s
 def _style_normalize_client_text(text: str) -> str:
     """Жёсткое правило стиля Владимира: длинное/среднее тире — признак AI-текста."""
     return (text or "").replace(" — ", ", ").replace(" – ", ", ").replace("—", "-").replace("–", "-").strip()
+
+
+# --- Защита от протёкшей заглушки обращения «Имя» -------------------------------
+# Корень рецидива «движок не работает» (2026-06-15): обезличенные примеры стиля в
+# паках содержат заглушку «[Имя]» (84 шт.), и писатель копировал её в клиента как
+# «Имя, добрый день» — хотя настоящее имя есть в карточке. Имя не было жёстким полем
+# промпта, а пост-фильтра не было вовсе. Здесь — единый барьер: имя клиента валидно
+# подставляется в обращение, а любая неустранимая заглушка помечается флагом гейта,
+# чтобы НИКОГДА не дойти до клиента как «готовый» черновик.
+_NAME_PLACEHOLDER_WORDS = r"(?:имя|name|обращение|клиент|client|fname|first[_ ]?name)"
+# Скобочная/фигурная заглушка где угодно: «[Имя]», «{name}», «{{name}}», «[обращение]».
+# В скобках не бывает настоящего слова — это всегда служебная заглушка.
+_NAME_PLACEHOLDER_BRACKET_RE = re.compile(
+    r"[\[\{]+\s*" + _NAME_PLACEHOLDER_WORDS + r"\s*[\]\}]+", re.IGNORECASE
+)
+# Вокатив-обращение в начале строки: «Имя, …», «[Имя]: …», «{name} - …».
+# Захватываем первую букву следующего слова, чтобы при срезе поднять её регистр.
+_NAME_PLACEHOLDER_VOCATIVE_RE = re.compile(
+    r"(^|\n)[ \t]*[\[\{]?\s*" + _NAME_PLACEHOLDER_WORDS
+    + r"\s*[\]\}]?[ \t]*[,:;!.—–\-]+[ \t]*([A-Za-zА-Яа-яЁё])?",
+    re.IGNORECASE,
+)
+# Голое «Имя»/«Name» отдельным словом с заглавной (вне скобок) — обычно протёкшая
+# заглушка в середине («Меня зовут Имя»). НЕ подставляем (может быть имя агента),
+# только помечаем для ручной проверки.
+_NAME_PLACEHOLDER_BARE_RE = re.compile(r"(?<![А-Яа-яЁёA-Za-z])(?:Имя|Name)(?![А-Яа-яЁёA-Za-z])")
+_NAME_STOP = {"имя", "name", "клиент", "client", "лид", "лф", "тест", "обращение", "none", "null"}
+
+
+def _style_valid_client_name(name) -> str:
+    """Имя годно для подстановки в обращение: ОДНО слово, только буквы/дефис, без
+    точки/@/цифр, не служебная заглушка. Иначе '' — лучше «Здравствуйте» без имени,
+    чем мусор вроде «Dr.Neverov, добрый день» или подстановка @username (PII)."""
+    n = str(name or "").strip()
+    if not n or n.lower() in _NAME_STOP:
+        return ""
+    if not re.fullmatch(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\-]{1,}", n):
+        return ""
+    return n
+
+
+def _style_has_name_placeholder(text: str) -> bool:
+    """Осталась ли в готовом тексте неустранимая заглушка обращения (скобочная где
+    угодно или голое «Имя»/«Name» словом). Используется гейтом как hard-флаг."""
+    t = text or ""
+    return bool(_NAME_PLACEHOLDER_BRACKET_RE.search(t) or _NAME_PLACEHOLDER_BARE_RE.search(t))
+
+
+def sanitize_outgoing_draft(text: str, client_name: str = "") -> str:
+    """Единый санитайзер исходящего черновика — вычищает протёкшую заглушку обращения.
+    - Вокатив в начале строки → подставить настоящее имя клиента, иначе срезать
+      обращение и поднять регистр («Имя, добрый день» → «Добрый день»).
+    - Скобочные заглушки и голое «Имя» в середине НЕ трогаем подстановкой (риск
+      исказить имя агента, напр. «Меня зовут [Имя]») — их ловит гейт флагом.
+    Идемпотентен: чистый текст возвращается без изменений."""
+    if not text:
+        return text
+    name = _style_valid_client_name(client_name)
+
+    def _voc_sub(m):
+        lead = m.group(1) or ""
+        nextch = m.group(2) or ""
+        if name:
+            return f"{lead}{name}, {nextch}"
+        # обращение срезано — следующее слово начинает фразу, поднимаем регистр
+        return f"{lead}{nextch.upper()}"
+
+    return _NAME_PLACEHOLDER_VOCATIVE_RE.sub(_voc_sub, text).strip()
+
+
+def _style_name_from_lead_name(lead_name) -> str:
+    """Имя клиента из названия карточки («Александр 6967» → «Александр»,
+    «Mary Land 3177» → «Mary», «Dr.Neverov» → «Neverov», «Клиент» → ''). Бэкенд
+    извлекает имя сам, не завися от того, прислал ли его Mac-воркер отдельным полем
+    (закрывает гонку «черновик-до-имени»: при следующем пуше имя уже есть в lead_name)."""
+    raw = str(lead_name or "")
+    for junk in ("Заявка от", "Сделка из формы", "Сделка", "Копия", "ЛФ", "#"):
+        raw = raw.replace(junk, " ")
+    for tok in re.split(r"[\s,()./\\-]+", raw):
+        nm = _style_valid_client_name(tok)
+        if nm and len(nm) >= 3:
+            return nm
+    return ""
+
+
+def _style_normalize_card_fields(t: dict) -> dict:
+    """Барьер входных полей на приёме ЛЮБОГО продюсера (вкл. ad-hoc /tmp-скрипты):
+    битая стадия (сырой статус-ID/None) и контакт-заглушка (@username в phone) не
+    должны доезжать до карточки. Не трогает человекочитаемые значения и текст клиенту."""
+    stage = str(t.get("stage") or "").strip()
+    if re.fullmatch(r"\d+", stage) or stage.lower() in ("none", "null"):
+        t["stage"] = ""  # iOS скрывает пустую стадию (лучше пусто, чем числовой код)
+    for pkey in ("phone", "whatsapp_phone"):
+        val = str(t.get(pkey) or "").strip()
+        if val.startswith("@"):
+            t.setdefault("telegram_username", val.lstrip("@"))
+            t[pkey] = ""  # @username — это телеграм-ник, не телефон
+    return t
+# --------------------------------------------------------------------------------
 
 
 def _style_fetch_similar_sync(situation: str, scenario: str, k: int = 3) -> dict:
@@ -3589,6 +3718,21 @@ def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str, str]
             "правилами пака - приоритет у правки Владимира (кроме запрета длинного тире и "
             "выдуманных фактов - эти два правила нерушимы)."
         )
+    # Имя клиента — ЖЁСТКОЕ поле, а не мягкая «подсказка». Раньше имя было зарыто в
+    # client_situation_hint и проигрывало десяткам «[Имя]» в примерах пака → писатель
+    # копировал заглушку. Теперь обращение задаётся явной директивой.
+    client_name = _style_valid_client_name(payload.get("client_name"))
+    if client_name:
+        user_content += (
+            f"\n\nОБРАЩЕНИЕ: клиента зовут {client_name}. Начни сообщение с обращения "
+            f"по этому имени («{client_name}, ...»). НИКОГДА не пиши слова «Имя», «[Имя]», "
+            "«{name}» — это служебные заглушки из примеров, их писать клиенту нельзя."
+        )
+    else:
+        user_content += (
+            "\n\nОБРАЩЕНИЕ: имя клиента неизвестно. Пиши без обращения по имени — начни с "
+            "«Здравствуйте» или «Добрый день». НИКОГДА не пиши слова «Имя», «[Имя]», «{name}»."
+        )
     user_content += "\n\nНапиши черновик ответа Владимира. Только текст, без заголовков и пояснений."
     knowledge_text = _style_project_knowledge_text(payload)
     knowledge_directive = (
@@ -3601,6 +3745,9 @@ def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str, str]
         "Ты помогаешь Владимиру — агенту по недвижимости в Пхукете — писать ответы клиентам. "
         "Используй стиль и паттерны из пака ниже: структуру, тон, типичные CTA. "
         "Не копируй фразы дословно — повторяй структуру и тон. "
+        "В примерах ниже «[Имя]» и подобные скобки — это ЗАГЛУШКА обращения: вместо неё "
+        "всегда подставляй настоящее имя клиента (оно задано выше) или, если имени нет, "
+        "пиши без обращения. Саму заглушку «Имя»/«[Имя]» в ответ не переноси. "
         "Пиши только по-русски. Никогда не используй длинное тире (—) и среднее тире (–): "
         "только запятая, точка или короткий дефис. "
         + knowledge_directive +
