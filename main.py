@@ -1633,6 +1633,14 @@ async def get_tasks_today(authorization: Optional[str] = Header(default=None)):
 
     def _enrich(t: dict) -> dict:
         enriched = dict(t)
+        # Подсказка «ответить голосовым» (урок из выигранных сделок): считаем из
+        # контекста задачи. Это про канал, текст не трогаем — iOS показывает намёк.
+        enriched["voice_suggested"] = _style_voice_suggested(
+            enriched.get("style_runtime_pack_id") or "",
+            {"last_client_message_summary": enriched.get("context_summary"),
+             "client_situation_hint": enriched.get("request_text"),
+             "context_summary": enriched.get("context_summary")},
+        )
         if enriched.get("request_text"):
             enriched["request_text"] = _clean_request_text(enriched["request_text"])
         # Инцидент 2026-06-12: строка вместо объекта в last_significant_contact
@@ -3141,7 +3149,7 @@ def _style_load_approved_memory_records() -> list[dict]:
     return records
 
 
-def _style_select_memory_records(payload: dict, pack_id: str, limit: int = 8) -> dict:
+def _style_select_memory_records(payload: dict, pack_id: str, limit: int = 16) -> dict:
     channel = str(payload.get("channel") or "").lower()
     stage = str(payload.get("deal_stage") or payload.get("client_last_message_type") or "").lower()
     examples: list[dict] = []
@@ -3370,6 +3378,26 @@ def _style_fetch_similar_sync(situation: str, scenario: str, k: int = 3) -> dict
     except Exception as exc:
         log.warning("style_similar: fetch failed: %s", str(exc)[:160])
         return {"results": []}
+
+
+# Подсказка «ответить голосовым»: урок из выигранных сделок (2026-06-15) —
+# на тревожные/денежные/процедурные вопросы Владимир обычно отвечает голосовым.
+# Это про КАНАЛ, а не про текст: показываем подсказкой в карточке, текст не трогаем.
+_STYLE_VOICE_PACKS = {"payment_and_documents_explanation", "legal_remote_purchase_explanation"}
+_STYLE_VOICE_MARKERS = (
+    "платеж", "платёж", "перевод", "оплат", "депозит", "брон", "договор", "процедур",
+    "гаранти", "возврат", "нотариус", "юрид", "сомнева", "нервнича", "волну", "боюсь",
+    "переживаю", "риск", "безопасн", "не обман",
+)
+
+
+def _style_voice_suggested(pack_id: str, payload: dict) -> bool:
+    if pack_id in _STYLE_VOICE_PACKS:
+        return True
+    text = " ".join(str(payload.get(k) or "") for k in (
+        "last_client_message_summary", "client_situation_hint", "context_summary",
+    )).lower()
+    return any(m in text for m in _STYLE_VOICE_MARKERS)
 
 
 def _style_project_knowledge_text(payload: dict) -> str:
@@ -3710,6 +3738,7 @@ async def style_runtime_draft(
         "router_reason": router_reason,
         "similar_examples_used": len(payload.get("similar_examples") or []),
         "style_source": style_source,
+        "voice_suggested": _style_voice_suggested(pack_id, payload),
         "runtime_source": runtime_state.get("source"),
         "runtime_pack_loaded": bool(runtime_state.get("ok")),
         "runtime_pack_path": runtime_state.get("pack_path"),
