@@ -1092,3 +1092,24 @@ def test_full_push_does_not_wipe_existing_draft(app_client, widget_headers, inte
     client.post("/api/internal/tasks", headers=internal_headers, json={"tasks": [_task(7700, draft="Новый текст")]})
     task = client.get("/api/tasks/today", headers=widget_headers).json()["tasks"][0]
     assert task["suggested_message"] == "Новый текст"
+
+
+def test_crm_action_queue(app_client, widget_headers, internal_headers):
+    """Действия по задачам сделки (2026-06-15): «Выполнить»/«Поменять дату» в очередь."""
+    client, _ = app_client
+    r = client.post("/api/tasks/crm_action", headers=widget_headers,
+                    json={"crm_task_id": 555, "lead_id": 999, "action": "complete", "label": "Связаться"})
+    assert r.status_code == 200
+    r = client.post("/api/tasks/crm_action", headers=widget_headers,
+                    json={"crm_task_id": 556, "action": "reschedule", "due": "2099-01-01T11:00:00+07:00"})
+    assert r.status_code == 200
+    aid = r.json()["id"]
+    pend = client.get("/api/internal/crm_actions", headers=internal_headers).json()
+    assert pend["count"] == 2
+    # reschedule без due → 400; неизвестный action → 400; widget не лезет в internal
+    assert client.post("/api/tasks/crm_action", headers=widget_headers, json={"crm_task_id": 5, "action": "reschedule"}).status_code == 400
+    assert client.post("/api/tasks/crm_action", headers=widget_headers, json={"crm_task_id": 5, "action": "foo"}).status_code == 400
+    assert client.get("/api/internal/crm_actions", headers=widget_headers).status_code in (401, 403)
+    # done убирает из pending
+    client.post(f"/api/internal/crm_actions/{aid}/done", headers=internal_headers, json={"status": "applied", "result": "ok"})
+    assert client.get("/api/internal/crm_actions", headers=internal_headers).json()["count"] == 1

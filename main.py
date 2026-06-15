@@ -1212,6 +1212,87 @@ async def internal_task_reschedule(
     raise HTTPException(status_code=404, detail=f"task#{task_id} not found")
 
 
+# ---------------------------------------------------------------------------
+# CRM-действия по задачам сделки (2026-06-15): из карточки Владимир жмёт
+# «Выполнить» / «Поменять дату» напротив ЛЮБОЙ активной задачи сделки. iOS
+# кладёт действие в очередь, CRM-воркер исполняет в amoCRM (только по команде
+# Владимира). Ключ — amoCRM task_id (задача может и не быть отдельной карточкой).
+# ---------------------------------------------------------------------------
+CRM_ACTIONS_FILE = Path(os.environ.get("CRM_ACTIONS_FILE", "/var/data/crm_actions.json"))
+
+
+def _load_crm_actions() -> list:
+    if CRM_ACTIONS_FILE.exists():
+        try:
+            return json.loads(CRM_ACTIONS_FILE.read_text())
+        except Exception:
+            return []
+    return []
+
+
+def _save_crm_actions(items: list) -> None:
+    CRM_ACTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CRM_ACTIONS_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=1))
+
+
+@app.post("/api/tasks/crm_action")
+async def post_crm_action(payload: dict = Body(...), authorization: Optional[str] = Header(default=None)):
+    """iOS: «Выполнить» (complete) / «Поменять дату» (reschedule) по задаче сделки.
+    {crm_task_id, lead_id?, action, due?(ISO для reschedule), label?}."""
+    check_token(authorization)
+    try:
+        crm_task_id = int(payload.get("crm_task_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="crm_task_id required (int)")
+    action = (payload.get("action") or "").strip()
+    if action not in ("complete", "reschedule"):
+        raise HTTPException(status_code=400, detail="action must be complete|reschedule")
+    due = (payload.get("due") or "").strip()
+    if action == "reschedule" and not due:
+        raise HTTPException(status_code=400, detail="due required for reschedule")
+    items = _load_crm_actions()
+    aid = f"crmact-{int(datetime.now(timezone.utc).timestamp()*1000)}"
+    items.append({
+        "id": aid, "crm_task_id": crm_task_id,
+        "lead_id": payload.get("lead_id"), "action": action, "due": due,
+        "label": (payload.get("label") or "")[:200],
+        "status": "pending", "created_at": datetime.now(timezone.utc).isoformat(),
+        "result": None,
+    })
+    if len(items) > 300:
+        del items[: len(items) - 300]
+    _save_crm_actions(items)
+    log.info(f"crm_action {aid}: {action} task#{crm_task_id} due={due or '-'}")
+    return {"status": "ok", "id": aid}
+
+
+@app.get("/api/internal/crm_actions")
+async def list_crm_actions(authorization: Optional[str] = Header(default=None)):
+    """CRM-воркер забирает pending-действия."""
+    check_internal(authorization)
+    pending = [a for a in _load_crm_actions() if a.get("status") == "pending"]
+    return {"count": len(pending), "actions": pending}
+
+
+@app.post("/api/internal/crm_actions/{action_id}/done")
+async def crm_action_done(action_id: str, payload: dict = Body(default={}),
+                          authorization: Optional[str] = Header(default=None)):
+    """CRM-воркер рапортует о выполнении: status=applied|failed + result."""
+    check_internal(authorization)
+    status_val = payload.get("status") or "applied"
+    if status_val not in ("applied", "failed"):
+        raise HTTPException(status_code=400, detail="invalid status")
+    items = _load_crm_actions()
+    for a in items:
+        if a.get("id") == action_id:
+            a["status"] = status_val
+            a["result"] = str(payload.get("result") or "")[:500]
+            a["done_at"] = datetime.now(timezone.utc).isoformat()
+            _save_crm_actions(items)
+            return {"status": "ok"}
+    raise HTTPException(status_code=404, detail="action not found")
+
+
 @app.post("/api/triggers/reclassify")
 async def trigger_reclassify(authorization: Optional[str] = Header(default=None)):
     """iOS просит пересобрать метки приоритета по текущим задачам."""
