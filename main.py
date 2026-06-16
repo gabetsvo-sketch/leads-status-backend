@@ -2401,6 +2401,64 @@ async def list_sent_events(
     return {"count": len(events), "events": events}
 
 
+@app.get("/api/metrics/edit_rate")
+async def metrics_edit_rate(
+    weeks: int = 8,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Объективная метрика качества стиля: насколько сильно Владимир правит черновик
+    перед отправкой. edit_fraction = 1 - схожесть(оригинал, отправленное): 0 = отправил
+    как есть (движок попал в стиль), 1 = переписал полностью. Тренд ВНИЗ = движок учится.
+    Считается из журнала отправок SENT_EVENTS_FILE по ISO-неделям."""
+    check_token(authorization)
+    import difflib
+    from datetime import datetime as _dt, timedelta as _td
+    if not SENT_EVENTS_FILE.exists():
+        return {"weeks": []}
+    buckets: dict = {}
+    try:
+        for ln in SENT_EVENTS_FILE.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                e = json.loads(ln)
+            except Exception:
+                continue
+            if e.get("event") != "sent_manually":
+                continue
+            orig = (e.get("original_message") or "").strip()
+            final = (e.get("final_message") or "").strip()
+            if not final:
+                continue
+            try:
+                d = _dt.fromisoformat((e.get("ts") or "").replace("Z", "+00:00"))
+            except Exception:
+                continue
+            week_start = (d - _td(days=d.weekday())).date().isoformat()
+            frac = 0.0 if orig and orig == final else (
+                1.0 - difflib.SequenceMatcher(None, orig, final).ratio() if orig else 1.0
+            )
+            b = buckets.setdefault(week_start, {"sent": 0, "edited": 0, "sum_frac": 0.0})
+            b["sent"] += 1
+            if e.get("edited"):
+                b["edited"] += 1
+            b["sum_frac"] += frac
+    except Exception as exc:
+        log.warning(f"edit_rate read failed: {exc}")
+        return {"weeks": []}
+    rows = []
+    for wk in sorted(buckets.keys())[-max(1, weeks):]:
+        b = buckets[wk]
+        rows.append({
+            "week_start": wk,
+            "sent_count": b["sent"],
+            "edited_count": b["edited"],
+            "avg_edit_fraction": round(b["sum_frac"] / b["sent"], 3) if b["sent"] else 0.0,
+        })
+    return {"weeks": rows}
+
+
 @app.post("/api/internal/tasks/{task_id}/client_replied")
 async def task_client_replied(
     task_id: int,
@@ -3491,7 +3549,12 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
     context_status, missing_sources, snapshot = _style_context_status(payload)
     if context_status == "needs_context_review":
         risk = "high"
-        flags.append("missing_call_context")
+        # Переданный диалог: непрочитанный звонок принадлежит коллеге, передавшему
+        # сделку - не глушим черновик намертво, показываем с пометкой (soft - не в hard_block).
+        if payload.get("dialogue_transferred") or snapshot.get("dialogue_transferred"):
+            flags.append("missing_call_context_soft")
+        else:
+            flags.append("missing_call_context")
         missing.extend(missing_sources)
 
     price_intent = pack_id == "price_roi_explanation" or any(k in summary for k in ("цена", "price", "roi", "доход", "рассроч")) or bool(re.search(r"\bокуп", summary))
@@ -3507,9 +3570,11 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
     vlad_text = " ".join(str(payload.get(k) or "") for k in (
         "vladimir_feedback", "regen_feedback", "feedback_text", "client_situation_hint",
     )).lower()
-    figure_from_vladimir = bool(
-        set(re.findall(r"\d[\d.,]*", draft_low)) & set(re.findall(r"\d[\d.,]*", vlad_text))
-    )
+    # Сверяем только МНОГОЗНАЧНЫЕ числа (>=2 цифр): иначе случайная одиночная цифра
+    # («5» из «5 спален» в подсказке и «5 млн» в тексте) ложно подтверждала бы цену.
+    def _multi_digit_figs(s):
+        return {f for f in re.findall(r"\d[\d.,]*", s) if len(re.sub(r"\D", "", f)) >= 2}
+    figure_from_vladimir = bool(_multi_digit_figs(draft_low) & _multi_digit_figs(vlad_text))
     if price_intent:
         risk = "high"
         if "price_source_ref" not in facts and draft_has_price_figure and not figure_from_vladimir:
@@ -3550,16 +3615,18 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
     hard_block_flags = {
         "price_without_source", "pii_detected", "too_many_cta", "missing_call_context",
         "author_confusion", "unsupported_continuity_claim", "not_actual_client_ignored",
-        "ai_dash_detected", "internal_style_meta_phrase", "style_memory_contraindication",
+        "ai_dash_detected", "style_memory_contraindication",
         "name_placeholder",
+        # internal_style_meta_phrase («без давления» и т.п.) НЕ блокирует: это живые
+        # обороты Владимира, а не AI-маркер. Остаётся флагом-предупреждением.
     }
     flags = list(dict.fromkeys(flags))
     missing = list(dict.fromkeys(missing))
     safety_pass = not any(f in flags for f in hard_block_flags)
     if "missing_call_context" in flags:
         block_reason = "Контекст неполный: есть обязательный источник звонка/voice/Zoom, который не прочитан. Показываем предупреждение вместо черновика."
-    elif "ai_dash_detected" in flags or "internal_style_meta_phrase" in flags:
-        block_reason = "Черновик похож на AI-текст или содержит внутреннюю формулировку. Нужна ручная правка вместо показа как готового сообщения."
+    elif "ai_dash_detected" in flags:
+        block_reason = "Черновик похож на AI-текст (длинное тире). Нужна ручная правка вместо показа как готового сообщения."
     elif "style_memory_contraindication" in flags:
         block_reason = "Черновик нарушает approved Style Memory contraindication. Нужна ручная правка вместо показа как готового сообщения."
     elif "name_placeholder" in flags:
@@ -3772,8 +3839,10 @@ _STYLE_VOICE_MARKERS = (
 def _style_voice_suggested(pack_id: str, payload: dict) -> bool:
     if pack_id in _STYLE_VOICE_PACKS:
         return True
+    # Только сообщение/ситуация КЛИЕНТА. client_situation_hint содержит реплики и
+    # правки Владимира (его «платёж/договор» ложно триггерил бы голос) — не берём.
     text = " ".join(str(payload.get(k) or "") for k in (
-        "last_client_message_summary", "client_situation_hint", "context_summary",
+        "last_client_message_summary", "context_summary",
     )).lower()
     return any(m in text for m in _STYLE_VOICE_MARKERS)
 
@@ -3814,7 +3883,7 @@ def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str, str]
     is_messenger = channel in ("whatsapp", "telegram")
     facts = payload.get("facts_available") or []
     has_price_source = "price_source_ref" in facts
-    length_note = "1–3 предложения" if is_messenger else "3–5 предложений"
+    length_note = "1-3 предложения" if is_messenger else "3-5 предложений"
     price_note = (
         "Конкретные цены, проценты, доходность — НЕ упоминать: нет подтверждённого источника."
         if not has_price_source
@@ -3882,9 +3951,9 @@ def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str, str]
             "\n\n!!! ГЛАВНОЕ ТРЕБОВАНИЕ. Владимир прочитал прошлый черновик и просит "
             "переписать его так:\n"
             f"«{feedback}»\n"
-            "Выполни эту правку буквально и в первую очередь. Если она расходится с общими "
-            "правилами пака - приоритет у правки Владимира (кроме запрета длинного тире и "
-            "выдуманных фактов - эти два правила нерушимы)."
+            "Выполни эту правку буквально и в первую очередь. Она важнее похожих примеров из "
+            "архива выше. Если она расходится с общими правилами пака - приоритет у правки "
+            "Владимира (кроме запрета длинного тире и выдуманных фактов - эти два правила нерушимы)."
         )
     # Имя клиента — ЖЁСТКОЕ поле, а не мягкая «подсказка». Раньше имя было зарыто в
     # client_situation_hint и проигрывало десяткам «[Имя]» в примерах пака → писатель

@@ -152,11 +152,12 @@ def test_style_runtime_blocks_when_required_call_context_missing(app_client, off
     payload = {
         **BASE_REQUEST,
         "request_id": "req-style-missing-call",
-        "dialogue_transferred": True,
-        "last_significant_contact": {"channel": "call", "meaning": "клиент сказал не актуально"},
+        # Непереданный диалог: непрочитанный обязательный звонок — жёсткий блок.
+        # (Для ПЕРЕДАННОГО диалога missing_call_context смягчён до soft, 2026-06-16.)
+        "dialogue_transferred": False,
+        "last_significant_contact": {"channel": "call", "meaning": "уточнить детали"},
         "deal_context_snapshot": {
             "source_coverage": {"call_transcripts": "missing_required"},
-            "client_state": {"demand_status": "not_actual"},
         },
         "facts_available": ["object_ref", "price_source_ref"],
     }
@@ -256,11 +257,13 @@ def test_style_runtime_blocks_internal_meta_phrase_in_client_draft(app_client, o
 
     r = client.post("/style-runtime/v1/draft", headers=office_headers, json=payload)
 
+    # Новый контракт (2026-06-16): «без подборок и давления» — живой оборот Владимира,
+    # а не AI-маркер. Помечаем флагом-предупреждением, но черновик НЕ обнуляем.
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["safety_pass"] is False
-    assert body["draft_text"] == ""
     assert "internal_style_meta_phrase" in body["safety_flags"]
+    assert body["safety_pass"] is True
+    assert body["draft_text"]  # показываем, а не глушим в пустоту
     assert body["send_performed"] is False
     assert body["crm_mutated"] is False
 
