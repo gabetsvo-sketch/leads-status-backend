@@ -4224,6 +4224,225 @@ async def style_runtime_draft(
     }
 
 
+# ====== Тест-цепочка касаний ранней воронки «Взят в работу» (Этап 1, 2026-06-16) ======
+# Ручной прогон 7-шаговой цепочки перед автоматизацией. Аддитивно: новые эндпоинты +
+# отдельный стор, генерация переиспользует style_runtime_draft, смена статуса — очередь
+# crm_action. Без авто-отправки: на каждом шаге система ГОТОВИТ, Владимир подтверждает.
+TEST_CADENCE_FILE = Path(os.environ.get("TEST_CADENCE_FILE", "/var/data/test_cadence.json"))
+_STATUS_VZYAT_V_RABOTU = int(os.environ.get("STATUS_VZYAT_V_RABOTU", "82910594"))
+
+_TEST_CADENCE_STEPS = [
+    {"n": 1, "title": "Дозвон + стартовое сообщение", "actor": "you", "kind": "call"},
+    {"n": 2, "title": "Дубль во второй мессенджер", "actor": "auto", "kind": "dup"},
+    {"n": 3, "title": "Сообщение №2 (ценностное касание)", "actor": "auto", "kind": "message"},
+    {"n": 4, "title": "Сообщение №3 (ценностное касание)", "actor": "auto", "kind": "message"},
+    {"n": 5, "title": "Дозвон", "actor": "you", "kind": "call"},
+    {"n": 6, "title": "Финальное: актуальна ли заявка?", "actor": "auto", "kind": "message"},
+    {"n": 7, "title": "Смена статуса → Повторная квалификация", "actor": "auto", "kind": "status"},
+]
+_TEST_CADENCE_HINTS = {
+    2: "Клиент не ответил в основном мессенджере. Это дубль того же касания во второй мессенджер - короткое, естественное, без новых вопросов, чтобы сообщение точно увидели.",
+    3: "Ценностное касание, продолжая разговор с этим клиентом. Полезное про Пхукет, рынок или проект по контексту сделки, без вопроса «ну как, надумали?», без давления.",
+    4: "Ещё одно ценностное касание под другим углом (личное или экспертное), продолжая разговор. Не повторять прошлое сообщение.",
+    6: "Финальное короткое сообщение: мягко уточнить, актуален ли ещё вопрос недвижимости на Пхукете.",
+}
+_TEST_CADENCE_RATIONALE = {
+    2: "Клиент не ответил - дублируем во второй мессенджер, чтобы сообщение точно дошло. Текст тот же по сути, без давления.",
+    3: "Первое авто-касание: даём ценность (полезное про остров/рынок), не спрашиваем «надумали?» - оживляем интерес.",
+    4: "Второе касание под другим углом (личное/экспертное), чтобы поддержать диалог и не быть навязчивым.",
+    6: "Финал цепочки: мягко проверяем актуальность заявки перед сменой статуса.",
+}
+_TEST_CADENCE_NOTIF = {
+    1: "Позвони клиенту {name} и отправь стартовое.",
+    2: "Готов дубль для второго мессенджера — проверь и отправь.",
+    3: "Готово касание №2 — проверь и отправь.",
+    4: "Готово касание №3 — проверь и отправь.",
+    5: "Пора позвонить клиенту {name}.",
+    6: "Готово финальное сообщение «актуальна ли заявка?» — проверь и отправь.",
+    7: "Можно сменить статус на «Повторную квалификацию».",
+}
+
+
+def _load_test_cadence() -> dict:
+    try:
+        return json.loads(TEST_CADENCE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_test_cadence(d: dict) -> None:
+    try:
+        TEST_CADENCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TEST_CADENCE_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as exc:
+        log.warning(f"test_cadence save failed: {exc}")
+
+
+def _test_cadence_is_target(t: dict) -> bool:
+    """Карточка в стадии «Взят в работу»."""
+    try:
+        if int(t.get("status_id") or 0) == _STATUS_VZYAT_V_RABOTU:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return "взят в работу" in (t.get("stage") or "").lower()
+
+
+def _test_cadence_suggested_time(t: dict) -> str:
+    """Окно 24ч; ничего после 23:59 по времени Владимира; утром не раньше 10:00 по клиенту.
+    На тесте — подсказка (переходы ручные)."""
+    from datetime import datetime as _dt, timedelta as _td
+    now = _dt.now(timezone.utc)
+    off = t.get("client_tz_offset_min")
+    if isinstance(off, int):
+        ch = (now + _td(minutes=off)).hour
+        if ch < 10:
+            return "утром с 10:00 по времени клиента"
+        if ch >= 22:
+            return "лучше завтра с 10:00 (поздно у клиента)"
+    return "можно сейчас"
+
+
+def _test_cadence_first_name(t: dict) -> str:
+    return _style_valid_client_name(t.get("client_name")) or _style_name_from_lead_name(t.get("lead_name")) or ""
+
+
+def _test_cadence_card(t: dict, state: dict) -> dict:
+    cid = str(t.get("task_id") or t.get("lead_id") or "")
+    current = int(state.get("current_step") or 1)
+    name = t.get("lead_name") or "клиент"
+    fname = _test_cadence_first_name(t) or name
+    msgs = state.get("messages") or {}
+    steps = []
+    for sd in _TEST_CADENCE_STEPS:
+        n = sd["n"]
+        status = "done" if n < current else ("current" if n == current else "pending")
+        notif = _TEST_CADENCE_NOTIF.get(n, "")
+        steps.append({
+            "n": n, "title": sd["title"], "actor": sd["actor"], "kind": sd["kind"],
+            "status": status,
+            "message": msgs.get(str(n)) or None,
+            "rationale": (_TEST_CADENCE_RATIONALE.get(n) if status in ("current", "done") and sd["kind"] in ("dup", "message") else None),
+            "notification": (notif.format(name=fname) if notif else None),
+            "suggested_time": (_test_cadence_suggested_time(t) if status == "current" else None),
+        })
+    return {
+        "card_id": cid, "lead_id": t.get("lead_id"), "lead_name": name,
+        "channels": {
+            "whatsapp": bool(t.get("whatsapp_phone") or t.get("phone")),
+            "telegram": bool(t.get("telegram_username") or t.get("telegram_id")),
+        },
+        "current_step": current, "steps": steps,
+    }
+
+
+async def _test_cadence_generate(t: dict, step_n: int) -> str:
+    """Генерация сообщения шага движком стиля (продолжая переписку клиента)."""
+    ctx = (t.get("context_summary") or "")
+    for _p in _PII_PATTERNS:
+        ctx = _p.sub(" ", ctx)
+    ctx = re.sub(r"\s{2,}", " ", ctx).strip()[:400]
+    payload = {
+        "request_id": f"cadence-{str(abs(t.get('task_id') or t.get('lead_id') or 0))[-6:]}-{step_n}",
+        "deal_ref": f"cad-{str(abs(t.get('lead_id') or 0))[-6:]}",
+        "channel": (t.get("last_message_channel") or t.get("last_incoming_channel") or "whatsapp"),
+        "deal_stage": "question", "client_last_message_type": "silence",
+        "requested_output": "client_reply_draft",
+        "last_client_message_summary": ctx,
+        "client_situation_hint": _TEST_CADENCE_HINTS.get(step_n, ""),
+        "client_name": _test_cadence_first_name(t),
+        "last_significant_contact": t.get("last_significant_contact"),
+        "facts_available": [],
+    }
+    try:
+        resp = await style_runtime_draft(payload=payload, authorization=f"Bearer {OFFICE_TOKEN}")
+        return (resp.get("draft_text") or "").strip()
+    except Exception as exc:
+        log.warning(f"test_cadence generate step {step_n} failed: {str(exc)[:160]}")
+        return ""
+
+
+def _resolve_repeat_qual_status() -> tuple:
+    """(status_id, pipeline_id) этапа «Повторная квалификация» из каталога CRM."""
+    try:
+        cat = json.loads(CRM_CATALOG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None, None
+    for pl in cat.get("pipelines", []):
+        for st in pl.get("statuses", []):
+            nm = (st.get("name") or "").lower()
+            if "повторн" in nm and "квалиф" in nm:
+                return st.get("id"), pl.get("id")
+    return None, None
+
+
+@app.get("/api/test/cadence/cards")
+async def test_cadence_cards(authorization: Optional[str] = Header(default=None)):
+    check_token(authorization)
+    state_all = _load_test_cadence()
+    cards = []
+    for t in (tasks_today.get("tasks") or []):
+        if not _test_cadence_is_target(t):
+            continue
+        cid = str(t.get("task_id") or t.get("lead_id") or "")
+        cards.append(_test_cadence_card(t, state_all.get(cid, {})))
+    return {"count": len(cards), "cards": cards}
+
+
+@app.post("/api/test/cadence/{card_id}/advance")
+async def test_cadence_advance(card_id: str, payload: dict = Body(default={}),
+                               authorization: Optional[str] = Header(default=None)):
+    """Владимир нажал «Выполнено» на текущем шаге → помечаем done, генерим сообщение
+    СЛЕДУЮЩЕГО шага (если авто), возвращаем обновлённую цепочку."""
+    check_token(authorization)
+    t = next((x for x in (tasks_today.get("tasks") or [])
+              if str(x.get("task_id") or x.get("lead_id") or "") == card_id), None)
+    if not t:
+        raise HTTPException(status_code=404, detail="card not found")
+    state_all = _load_test_cadence()
+    st = state_all.get(card_id) or {"current_step": 1, "messages": {}}
+    nxt = int(st.get("current_step") or 1) + 1
+    if nxt <= 7:
+        sd = _TEST_CADENCE_STEPS[nxt - 1]
+        if sd["actor"] == "auto" and sd["kind"] in ("dup", "message"):
+            msg = await _test_cadence_generate(t, nxt)
+            st.setdefault("messages", {})[str(nxt)] = msg
+    st["current_step"] = min(nxt, 8)
+    state_all[card_id] = st
+    _save_test_cadence(state_all)
+    return {"ok": True, "card": _test_cadence_card(t, st)}
+
+
+@app.post("/api/test/cadence/{card_id}/status_change")
+async def test_cadence_status_change(card_id: str, authorization: Optional[str] = Header(default=None)):
+    """Шаг 7: ставим в очередь смену статуса на «Повторная квалификация» (CRM-воркер исполнит)."""
+    check_token(authorization)
+    t = next((x for x in (tasks_today.get("tasks") or [])
+              if str(x.get("task_id") or x.get("lead_id") or "") == card_id), None)
+    if not t:
+        raise HTTPException(status_code=404, detail="card not found")
+    status_id, pipeline_id = _resolve_repeat_qual_status()
+    if not status_id or not pipeline_id:
+        raise HTTPException(status_code=400, detail="статус «Повторная квалификация» не найден в каталоге CRM")
+    items = _load_crm_actions()
+    aid = f"crmact-{int(datetime.now(timezone.utc).timestamp()*1000)}"
+    items.append({
+        "id": aid, "crm_task_id": 0, "lead_id": t.get("lead_id"), "action": "change_status",
+        "due": "", "status_id": int(status_id), "pipeline_id": int(pipeline_id), "loss_reason_id": None,
+        "label": "Тест-цепочка → Повторная квалификация",
+        "status": "pending", "created_at": datetime.now(timezone.utc).isoformat(), "result": None,
+    })
+    if len(items) > 300:
+        del items[: len(items) - 300]
+    _save_crm_actions(items)
+    state_all = _load_test_cadence()
+    st = state_all.get(card_id) or {"current_step": 7, "messages": {}}
+    st["current_step"] = 8
+    state_all[card_id] = st
+    _save_test_cadence(state_all)
+    return {"ok": True, "action_id": aid}
+
+
 @app.post("/style-runtime/v1/feedback")
 async def style_runtime_feedback(
     payload: dict = Body(...),
