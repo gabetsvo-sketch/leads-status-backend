@@ -768,7 +768,33 @@ async def lifespan(app: FastAPI):
         await client.disconnect()
 
 
-app = FastAPI(lifespan=lifespan)
+# Единый источник версии бэкенда — VERSION.json в корне backend/ (§5.3, §11.4 стандарта v0.01.001)
+_VERSION_FILE = Path(__file__).resolve().parent / "VERSION.json"
+
+
+def _read_version():
+    try:
+        with open(_VERSION_FILE, encoding="utf-8") as f:
+            v = json.load(f)
+        g, m, r = int(v["generation"]), int(v["milestone"]), int(v["revision"])
+        return {
+            "display_version": f"v{g}.{m:02d}.{r:03d}",
+            "semver": f"{g}.{m}.{r}",
+            "generation": g,
+            "milestone": m,
+            "revision": r,
+            "component": "leads-status-backend",
+        }
+    except Exception:
+        return {"display_version": "UNKNOWN", "semver": "0.0.0",
+                "generation": 0, "milestone": 0, "revision": 0,
+                "component": "leads-status-backend"}
+
+
+BACKEND_VERSION = _read_version()
+
+
+app = FastAPI(lifespan=lifespan, version=BACKEND_VERSION["semver"])
 
 
 def check_token(authorization: Optional[str]) -> None:
@@ -792,7 +818,13 @@ def check_office_write(authorization: Optional[str]) -> None:
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "version": BACKEND_VERSION["display_version"]}
+
+
+@app.get("/version")
+async def version():
+    """Версия backend-компонента (источник истины — VERSION.json). §12.2 стандарта v0.01.001."""
+    return BACKEND_VERSION
 
 
 def _maybe_auto_revert() -> bool:
