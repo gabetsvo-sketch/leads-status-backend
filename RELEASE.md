@@ -1,0 +1,45 @@
+# RELEASE — leads-status/backend
+
+Порядок выпуска, отката и манифест версий компонентов (§25, §11.7 стандарта VIBE-CODE v0.01.001).
+
+## Конвейер выпуска
+
+1. Changeset с поднятой версией (`VERSION.json`) — если менялся код продукта (`main.py`/`requirements.txt`).
+2. `git commit` → `git push origin main`.
+3. **CI (`.github/workflows/ci.yml`) job `verify`:** страж версии (`tools/ci_version_guard.py`, §12.4) + полный набор тестов (`pytest tests/`, Python 3.11.9 как в Render).
+4. **job `deploy`** (`needs: verify`): запускается ТОЛЬКО если `verify` прошла И изменён код продукта → дёргает Render Deploy API (service `srv-d7n3t4gsfn5c73drkpmg`).
+5. Render: `pip install -r requirements.txt` → `uvicorn main:app` → healthcheck `/health`.
+6. Проверка после: `GET /version` и `GET /health` показывают ожидаемую версию.
+
+Правки документов/тестов/CI **не вызывают** редеплой (страж отдаёт `product_changed=false`).
+
+## Release gate (§25.1) — что должно быть верно перед выкладкой
+- working tree чист; commit создан и push подтверждён;
+- версия поднята в том же changeset (если менялся код продукта);
+- `verify` зелёный (страж + 114 тестов);
+- `/health` отвечает 200 после деплоя.
+
+## Откат
+- **Быстрый:** `git revert <commit>` → push → CI прогонит и (если код продукта) передеплоит предыдущее поведение.
+- **Аварийный, без GitHub:** в панели Render — «Manual Deploy» нужного прошлого commit, либо «Rollback» к предыдущему успешному деплою.
+- **Состояние (JSON-файлы на диске Render)** при откате кода не меняется — миграций нет, схема — простые JSON (см. `RISK_MAP.md`).
+
+## Аварийный деплой в обход проверок
+Если CI лежит, а выложить нужно срочно: GitHub → Actions → «CI + Deploy» → Run workflow → `force_deploy=true`. Либо кнопка Deploy в Render. **Использовать осознанно** — это обход защиты §12.4.
+
+## Манифест версий компонентов (§11.7)
+
+Продукт LeadsStatus = backend + приложение iOS + Mac-воркеры. Версии ведутся раздельно (разные репозитории/среды); здесь — точка сверки, что с чем согласовано.
+
+| Компонент | Версия / сборка | Где живёт | Источник истины |
+|---|---|---|---|
+| **backend** | **v0.01.001** | этот репозиторий, Render | `VERSION.json` → `/version` |
+| iOS-приложение | сборка ~65 (на 2026-06-22) | репозиторий iOS (отдельная сессия) | проект Xcode / TestFlight |
+| Mac-воркеры | без версии (по решению — UNKNOWN) | `~/.local/bin/leadsstatus_*_worker.py` | LaunchAgents `com.leadsstatus.*` |
+
+Воркеры (интервалы): `regen`(45с) · `crm`(20с) · `priority`(20с) · `newleads`(60с) · `tasks`(20с) · `enrich`(45с).
+
+**Открыто (не сделано):** у iOS и воркеров нет машинной версии, связанной с backend. Полная «склейка» = (1) iOS отдаёт свою сборку и ожидаемую версию backend; (2) воркеры рапортуют версию в heartbeat. Пока сверка ручная по этой таблице — обновлять при выпуске любого компонента.
+
+## История версий backend
+Полная — в `CHANGELOG.md`. Кратко: v0.01.000 — baseline (20.06); v0.01.001 — защита выкладки в CI (22.06).
