@@ -44,7 +44,12 @@ jobs:
     # запуск с force_deploy=true.
     if: ${{ always() && ((needs.verify.result == 'success' && needs.verify.outputs.product_changed == 'true') || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_deploy == 'true')) }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # для простановки release-тега
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Триггер деплоя на Render
         env:
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
@@ -67,3 +72,16 @@ jobs:
             exit 1
           fi
           echo "Deploy triggered: $deploy_id"
+      - name: Пометить релиз тегом v<версия> (трассируемость §11.5)
+        continue-on-error: true  # сбой тега не должен ломать успешный деплой
+        run: |
+          ver=$(python3 -c "import json; v=json.load(open('VERSION.json')); print(f\"v{v['generation']}.{v['milestone']:02d}.{v['revision']:03d}\")")
+          if git rev-parse "$ver" >/dev/null 2>&1; then
+            echo "Тег $ver уже существует — пропускаю (один тег = один артефакт)."
+          else
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git tag -a "$ver" -m "Release $ver (deploy $GITHUB_SHA)"
+            git push origin "$ver"
+            echo "Создан release-тег $ver на $GITHUB_SHA"
+          fi
