@@ -18,7 +18,10 @@ def test_health_no_auth(app_client):
     client, main = app_client
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"ok": True}
+    body = r.json()
+    assert body["ok"] is True
+    # С базовой фиксации v0.01.000 /health также отдаёт version (§12.2 стандарта).
+    assert "version" in body and body["version"].startswith("v")
 
 
 def test_status_requires_widget_token(app_client, widget_headers):

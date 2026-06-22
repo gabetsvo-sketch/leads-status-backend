@@ -1,0 +1,67 @@
+name: CI + Deploy
+
+# Защита выкладки (§12.4 стандарта VIBE-CODE v0.01.001):
+# на каждый push в main сначала ПРОВЕРКА (страж версии + стабильные тесты),
+# деплой на Render — только если проверка прошла.
+# Аварийный деплой: запустить вручную (Run workflow) с force_deploy=true,
+# либо кнопкой Deploy в самом Render.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "Деплоить даже если проверки не прошли (аварийно)"
+        type: boolean
+        default: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # нужна история для стража версии (git show before:VERSION.json)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"  # как в Render (render.yaml PYTHON_VERSION)
+      - name: Установить зависимости
+        run: pip install -r requirements.txt
+      - name: Страж версии — код изменён → версия поднята (§12.4)
+        if: github.event_name == 'push'
+        run: python tools/ci_version_guard.py "${{ github.event.before }}" "${{ github.sha }}"
+      - name: Тесты — стабильный набор (блокирует деплой)
+        run: pytest tests/ --ignore=tests/test_style_runtime_http.py --ignore=tests/test_style_runtime_r2.py -q
+      - name: Тесты http/r2 — известно нестабильны, НЕ блокируют (см. VERSION_AUDIT.md)
+        continue-on-error: true
+        run: pytest tests/test_style_runtime_http.py tests/test_style_runtime_r2.py -q
+
+  deploy:
+    needs: verify
+    # Деплоим если проверка прошла; либо ручной аварийный запуск с force_deploy=true.
+    if: ${{ always() && (needs.verify.result == 'success' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_deploy == 'true')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Триггер деплоя на Render
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SERVICE_ID: srv-d7n3t4gsfn5c73drkpmg
+        run: |
+          if [ -z "$RENDER_API_KEY" ]; then
+            echo "::error::RENDER_API_KEY secret is not set in repo settings."
+            exit 1
+          fi
+          response=$(curl -sS -X POST \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            "https://api.render.com/v1/services/$SERVICE_ID/deploys" \
+            -d '{}')
+          echo "Render API response:"
+          echo "$response"
+          deploy_id=$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
+          if [ -z "$deploy_id" ]; then
+            echo "::error::Failed to trigger deploy."
+            exit 1
+          fi
+          echo "Deploy triggered: $deploy_id"
