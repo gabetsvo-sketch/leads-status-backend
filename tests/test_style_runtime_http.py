@@ -26,16 +26,20 @@ def sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def make_snapshot(pack_text="PACK FROM HTTP", *, manual_review_only=True, bad_pack_hash=False, include_pack=True):
+def make_snapshot(pack_text="PACK FROM HTTP", *, pack_id="client_asks_question",
+                  manual_review_only=True, bad_pack_hash=False, include_pack=True):
+    # pack_id берём тот, что реально выбирает роутер для запроса (роутер мог
+    # поменяться) — иначе _style_manifest_pack не найдёт пак и снапшот отвергнется.
+    pack_path = f"packs/{pack_id}.md"
     index = {
         "schema_version": "style-runtime-index-v1",
-        "packs": [{"pack_id": "client_asks_question", "pack_file": "packs/client_asks_question.md"}],
+        "packs": [{"pack_id": pack_id, "pack_file": pack_path}],
     }
     index_text = json.dumps(index, ensure_ascii=False, sort_keys=True)
     pack_hash = "0" * 64 if bad_pack_hash else sha(pack_text)
     packs = []
     if include_pack:
-        packs.append({"pack_id": "client_asks_question", "path": "packs/client_asks_question.md", "sha256": pack_hash})
+        packs.append({"pack_id": pack_id, "path": pack_path, "sha256": pack_hash})
     manifest = {
         "schema_version": "style-runtime-publish-manifest-v1",
         "published_at": "2026-06-09T08:00:00+00:00",
@@ -89,7 +93,8 @@ def configure_http(main, monkeypatch):
 def test_style_runtime_http_success_loads_pack(app_client, office_headers, monkeypatch):
     client, main = app_client
     configure_http(main, monkeypatch)
-    snapshot = make_snapshot("HTTP pack content for followup")
+    pack_id = main._style_choose_pack(BASE_REQUEST)[0]
+    snapshot = make_snapshot("HTTP pack content for followup", pack_id=pack_id)
 
     with patch("urllib.request.urlopen", side_effect=make_urlopen_mock(snapshot)):
         r = client.post("/style-runtime/v1/draft", headers=office_headers, json=BASE_REQUEST)
@@ -99,7 +104,7 @@ def test_style_runtime_http_success_loads_pack(app_client, office_headers, monke
     assert body["manual_review_only"] is True
     assert body["runtime_source"] == "http"
     assert body["runtime_pack_loaded"] is True
-    assert body["runtime_pack_path"] == "packs/client_asks_question.md"
+    assert body["runtime_pack_path"] == f"packs/{pack_id}.md"
     assert body["runtime_snapshot_version"] == "2026-06-09T08:00:00+00:00"
     assert body["runtime_block_reason"] is None
     assert body["send_performed"] is False
@@ -109,7 +114,8 @@ def test_style_runtime_http_success_loads_pack(app_client, office_headers, monke
 def test_style_runtime_http_unavailable_uses_last_good(app_client, office_headers, monkeypatch):
     client, main = app_client
     configure_http(main, monkeypatch)
-    snapshot = make_snapshot("good pack content")
+    pack_id = main._style_choose_pack(BASE_REQUEST)[0]
+    snapshot = make_snapshot("good pack content", pack_id=pack_id)
 
     with patch("urllib.request.urlopen", side_effect=make_urlopen_mock(snapshot)):
         first = client.post("/style-runtime/v1/draft", headers=office_headers, json=BASE_REQUEST)
@@ -131,7 +137,11 @@ def test_style_runtime_http_unavailable_uses_last_good(app_client, office_header
 def test_style_runtime_http_bad_sha256_rejects_snapshot(app_client, office_headers, monkeypatch):
     client, main = app_client
     configure_http(main, monkeypatch)
-    snapshot = make_snapshot("tampered pack", bad_pack_hash=True)
+    # Изолируем проверку ОТКЛОНЕНИЯ от availability-фолбэка на вшитый пак:
+    # без этого отвергнутый снапшот подменялся бы доверенным локальным паком.
+    monkeypatch.setattr(main, "_style_load_local_pack_text", lambda pid: ("", None))
+    pack_id = main._style_choose_pack(BASE_REQUEST)[0]
+    snapshot = make_snapshot("tampered pack", pack_id=pack_id, bad_pack_hash=True)
 
     with patch("urllib.request.urlopen", side_effect=make_urlopen_mock(snapshot)):
         r = client.post("/style-runtime/v1/draft", headers=office_headers, json=BASE_REQUEST)
@@ -150,7 +160,9 @@ def test_style_runtime_http_bad_sha256_rejects_snapshot(app_client, office_heade
 def test_style_runtime_http_missing_manual_review_only_rejected(app_client, office_headers, monkeypatch):
     client, main = app_client
     configure_http(main, monkeypatch)
-    snapshot = make_snapshot(manual_review_only=False)
+    monkeypatch.setattr(main, "_style_load_local_pack_text", lambda pid: ("", None))
+    pack_id = main._style_choose_pack(BASE_REQUEST)[0]
+    snapshot = make_snapshot(pack_id=pack_id, manual_review_only=False)
 
     with patch("urllib.request.urlopen", side_effect=make_urlopen_mock(snapshot)):
         r = client.post("/style-runtime/v1/draft", headers=office_headers, json=BASE_REQUEST)
@@ -166,7 +178,9 @@ def test_style_runtime_http_missing_manual_review_only_rejected(app_client, offi
 def test_style_runtime_http_missing_pack_guarded_empty_draft(app_client, office_headers, monkeypatch):
     client, main = app_client
     configure_http(main, monkeypatch)
-    snapshot = make_snapshot(include_pack=False)
+    monkeypatch.setattr(main, "_style_load_local_pack_text", lambda pid: ("", None))
+    pack_id = main._style_choose_pack(BASE_REQUEST)[0]
+    snapshot = make_snapshot(pack_id=pack_id, include_pack=False)
 
     with patch("urllib.request.urlopen", side_effect=make_urlopen_mock(snapshot)):
         r = client.post("/style-runtime/v1/draft", headers=office_headers, json=BASE_REQUEST)

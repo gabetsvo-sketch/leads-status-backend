@@ -1,10 +1,11 @@
 name: CI + Deploy
 
 # Защита выкладки (§12.4 стандарта VIBE-CODE v0.01.001):
-# на каждый push в main сначала ПРОВЕРКА (страж версии + стабильные тесты),
-# деплой на Render — только если проверка прошла.
-# Аварийный деплой: запустить вручную (Run workflow) с force_deploy=true,
-# либо кнопкой Deploy в самом Render.
+# на каждый push в main сначала ПРОВЕРКА (страж версии + тесты),
+# деплой на Render — только если проверка прошла И изменён код продукта
+# (main.py / requirements.txt). Правки документов/тестов/CI не вызывают
+# редеплой. Аварийный деплой: ручной запуск (Run workflow) с force_deploy=true
+# либо кнопка Deploy в самом Render.
 
 on:
   push:
@@ -12,13 +13,15 @@ on:
   workflow_dispatch:
     inputs:
       force_deploy:
-        description: "Деплоить даже если проверки не прошли (аварийно)"
+        description: "Деплоить даже если проверки не прошли / без изменения кода (аварийно)"
         type: boolean
         default: false
 
 jobs:
   verify:
     runs-on: ubuntu-latest
+    outputs:
+      product_changed: ${{ steps.guard.outputs.product_changed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,19 +31,18 @@ jobs:
           python-version: "3.11.9"  # как в Render (render.yaml PYTHON_VERSION)
       - name: Установить зависимости
         run: pip install -r requirements.txt
-      - name: Страж версии — код изменён → версия поднята (§12.4)
+      - id: guard
+        name: Страж версии — код изменён → версия поднята (§12.4)
         if: github.event_name == 'push'
         run: python tools/ci_version_guard.py "${{ github.event.before }}" "${{ github.sha }}"
-      - name: Тесты — стабильный набор (блокирует деплой)
-        run: pytest tests/ --ignore=tests/test_style_runtime_http.py --ignore=tests/test_style_runtime_r2.py -q
-      - name: Тесты http/r2 — известно нестабильны, НЕ блокируют (см. VERSION_AUDIT.md)
-        continue-on-error: true
-        run: pytest tests/test_style_runtime_http.py tests/test_style_runtime_r2.py -q
+      - name: Тесты (полный набор, блокирует деплой)
+        run: pytest tests/ -q
 
   deploy:
     needs: verify
-    # Деплоим если проверка прошла; либо ручной аварийный запуск с force_deploy=true.
-    if: ${{ always() && (needs.verify.result == 'success' || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_deploy == 'true')) }}
+    # Деплоим если проверка прошла И изменён код продукта; либо ручной аварийный
+    # запуск с force_deploy=true.
+    if: ${{ always() && ((needs.verify.result == 'success' && needs.verify.outputs.product_changed == 'true') || (github.event_name == 'workflow_dispatch' && github.event.inputs.force_deploy == 'true')) }}
     runs-on: ubuntu-latest
     steps:
       - name: Триггер деплоя на Render

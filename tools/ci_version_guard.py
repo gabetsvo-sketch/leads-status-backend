@@ -13,6 +13,7 @@
 Локально для проверки:  python tools/ci_version_guard.py HEAD~1 HEAD
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -20,6 +21,16 @@ import sys
 
 def _git(*args: str) -> str:
     return subprocess.run(["git", *args], capture_output=True, text=True).stdout
+
+
+def _emit_output(product_changed: bool) -> None:
+    """Отдаёт в GitHub Actions флаг, изменён ли код продукта (для гейта деплоя:
+    деплоим только при изменении main.py/requirements, чтобы правки документов/
+    тестов/CI не вызывали no-op редеплой Render)."""
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a", encoding="utf-8") as f:
+            f.write(f"product_changed={'true' if product_changed else 'false'}\n")
 
 
 def _version_int(raw: str) -> int:
@@ -41,6 +52,7 @@ def main() -> int:
 
     if re.fullmatch(r"0+", before or ""):
         print("OK: новая ветка / нет базового коммита — страж пропущен.")
+        _emit_output(False)
         return 0
 
     changed = [p for p in _git("diff", "--name-only", before, after).splitlines() if p.strip()]
@@ -48,7 +60,9 @@ def main() -> int:
     if not product:
         print("OK: код продукта не изменён — повышение версии не требуется.")
         print("    изменены:", ", ".join(changed) or "(ничего)")
+        _emit_output(False)
         return 0
+    _emit_output(True)
 
     try:
         old = _version_int(_git("show", f"{before}:VERSION.json"))

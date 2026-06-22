@@ -49,13 +49,16 @@ def sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def make_snapshot(pack_text="PACK FROM R2", *, manual_review_only=True, bad_pack_hash=False, include_pack=True):
+def make_snapshot(pack_text="PACK FROM R2", *, pack_id="client_asks_question",
+                  manual_review_only=True, bad_pack_hash=False, include_pack=True):
+    # pack_id — тот, что реально выбирает роутер для запроса (роутер мог поменяться).
+    pack_path = f"packs/{pack_id}.md"
     index = {
         "schema_version": "style-runtime-index-v1",
         "packs": [
             {
-                "pack_id": "client_asks_question",
-                "pack_file": "packs/client_asks_question.md",
+                "pack_id": pack_id,
+                "pack_file": pack_path,
             }
         ],
     }
@@ -63,7 +66,7 @@ def make_snapshot(pack_text="PACK FROM R2", *, manual_review_only=True, bad_pack
     pack_hash = "0" * 64 if bad_pack_hash else sha(pack_text)
     packs = []
     if include_pack:
-        packs.append({"pack_id": "client_asks_question", "path": "packs/client_asks_question.md", "sha256": pack_hash})
+        packs.append({"pack_id": pack_id, "path": pack_path, "sha256": pack_hash})
     manifest = {
         "schema_version": "style-runtime-publish-manifest-v1",
         "published_at": "2026-06-09T05:00:00+00:00",
@@ -77,7 +80,7 @@ def make_snapshot(pack_text="PACK FROM R2", *, manual_review_only=True, bad_pack
         "style-runtime/v1/latest/style-runtime-index-v1.json": index_text,
     }
     if include_pack:
-        objects["style-runtime/v1/latest/packs/client_asks_question.md"] = pack_text
+        objects[f"style-runtime/v1/latest/{pack_path}"] = pack_text
     return objects
 
 
@@ -108,7 +111,8 @@ def safe_payload():
 
 def test_style_runtime_r2_success_loads_pack_from_hash_valid_snapshot(app_client, office_headers, monkeypatch):
     client, main = app_client
-    r2 = FakeR2Client(make_snapshot("R2 pack content for client question"))
+    pack_id = main._style_choose_pack(safe_payload())[0]
+    r2 = FakeR2Client(make_snapshot("R2 pack content for client question", pack_id=pack_id))
     configure_r2(main, monkeypatch, r2)
 
     r = client.post("/style-runtime/v1/draft", headers=office_headers, json=safe_payload())
@@ -118,14 +122,15 @@ def test_style_runtime_r2_success_loads_pack_from_hash_valid_snapshot(app_client
     assert body["manual_review_only"] is True
     assert body["runtime_source"] == "r2"
     assert body["runtime_pack_loaded"] is True
-    assert body["runtime_pack_path"] == "packs/client_asks_question.md"
+    assert body["runtime_pack_path"] == f"packs/{pack_id}.md"
     assert body["runtime_snapshot_version"] == "2026-06-09T05:00:00+00:00"
     assert body["runtime_block_reason"] is None
 
 
 def test_style_runtime_r2_unavailable_uses_last_good_snapshot(app_client, office_headers, monkeypatch):
     client, main = app_client
-    r2_good = FakeR2Client(make_snapshot("initial good pack"))
+    pack_id = main._style_choose_pack(safe_payload())[0]
+    r2_good = FakeR2Client(make_snapshot("initial good pack", pack_id=pack_id))
     configure_r2(main, monkeypatch, r2_good)
     first = client.post("/style-runtime/v1/draft", headers=office_headers, json=safe_payload())
     assert first.status_code == 200, first.text
@@ -146,7 +151,10 @@ def test_style_runtime_r2_unavailable_uses_last_good_snapshot(app_client, office
 
 def test_style_runtime_r2_bad_hash_rejects_snapshot_without_last_good(app_client, office_headers, monkeypatch):
     client, main = app_client
-    r2 = FakeR2Client(make_snapshot("tampered pack", bad_pack_hash=True))
+    # Изолируем проверку ОТКЛОНЕНИЯ от availability-фолбэка на вшитый пак.
+    monkeypatch.setattr(main, "_style_load_local_pack_text", lambda pid: ("", None))
+    pack_id = main._style_choose_pack(safe_payload())[0]
+    r2 = FakeR2Client(make_snapshot("tampered pack", pack_id=pack_id, bad_pack_hash=True))
     configure_r2(main, monkeypatch, r2)
 
     r = client.post("/style-runtime/v1/draft", headers=office_headers, json=safe_payload())
@@ -164,7 +172,9 @@ def test_style_runtime_r2_bad_hash_rejects_snapshot_without_last_good(app_client
 
 def test_style_runtime_r2_missing_pack_falls_back_to_guarded_empty_draft(app_client, office_headers, monkeypatch):
     client, main = app_client
-    r2 = FakeR2Client(make_snapshot(include_pack=False))
+    monkeypatch.setattr(main, "_style_load_local_pack_text", lambda pid: ("", None))
+    pack_id = main._style_choose_pack(safe_payload())[0]
+    r2 = FakeR2Client(make_snapshot(pack_id=pack_id, include_pack=False))
     configure_r2(main, monkeypatch, r2)
 
     r = client.post("/style-runtime/v1/draft", headers=office_headers, json=safe_payload())
@@ -179,7 +189,9 @@ def test_style_runtime_r2_missing_pack_falls_back_to_guarded_empty_draft(app_cli
 
 def test_style_runtime_r2_manifest_without_manual_review_only_is_rejected(app_client, office_headers, monkeypatch):
     client, main = app_client
-    r2 = FakeR2Client(make_snapshot(manual_review_only=False))
+    monkeypatch.setattr(main, "_style_load_local_pack_text", lambda pid: ("", None))
+    pack_id = main._style_choose_pack(safe_payload())[0]
+    r2 = FakeR2Client(make_snapshot(pack_id=pack_id, manual_review_only=False))
     configure_r2(main, monkeypatch, r2)
 
     r = client.post("/style-runtime/v1/draft", headers=office_headers, json=safe_payload())
