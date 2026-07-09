@@ -3084,8 +3084,14 @@ _STYLE_NOT_ACTUAL_MARKERS = (
 
 def _style_text_has_pii(value) -> bool:
     text = str(value or "")
-    # Avoid false-positive on ISO dates in sanitized context snapshots.
-    text = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?\b", "", text)
+    # НЕ считать PII (иначе phone-регэксп ловит их за телефон → ложный hard-блок, аудит 07-09):
+    # ISO-даты, ру-даты DD.MM.YYYY, и цены/суммы/проценты (число + валюта/единица).
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?\b", " ", text)
+    text = re.sub(r"\b\d{1,2}\.\d{1,2}\.\d{2,4}\b", " ", text)
+    text = re.sub(
+        r"\d[\d\s.,]*\s*(?:млн|тыс|тысяч|руб|฿|бат|baht|thb|\$|usd|eur|€|%|процент|м2|кв\.?\s?м)",
+        " ", text, flags=re.I,
+    )
     return any(p.search(text) for p in _PII_PATTERNS)
 
 
@@ -3616,7 +3622,10 @@ def _style_select_memory_records(payload: dict, pack_id: str, limit: int = 16) -
             continue
         if not _style_memory_list_contains(record.get("channel"), channel):
             continue
-        if not _style_memory_list_contains(record.get("stage"), stage):
+        # Фильтр по стадии — ТОЛЬКО для глобальных записей (без pack). Запись, привязанная
+        # к паку, при совпадении пака — это её сценарий; доп. фильтр по стадии схлопывал
+        # память до 10 глобальных правил (словари стадий воркеров ≠ словарям записей, аудит 07-09).
+        if not record_pack and not _style_memory_list_contains(record.get("stage"), stage):
             continue
         record_type = str(record.get("type") or "").strip()
         if record_type == "contraindication":
@@ -3712,10 +3721,14 @@ def _style_safety_gate(payload: dict, draft_text: str, pack_id: str, style_memor
     draft_has_price_figure = bool(
         re.search(r"\d[\d\s.,]*\s*(?:млн|тыс|руб|฿|бат|baht|thb|\$|%|процент)", draft_low)
     )
-    # Если конкретную цифру задал сам Владимир в пожелании/подсказке (он просил
-    # «цифры важны, не заменять общими словами»), считаем её подтверждённой - не блокируем.
+    # Цифра ПОДТВЕРЖДЕНА, если уже звучала в реальной переписке (её называл Владимир ИЛИ
+    # клиент), в пожелании Владимира или памятке — тогда это не выдумка, а факт сделки.
+    # Раньше проверяли только feedback/hint → цена из самой переписки зря блокировалась
+    # (находка аудита 2026-07-09: «цены запрещены всегда»).
     vlad_text = " ".join(str(payload.get(k) or "") for k in (
         "vladimir_feedback", "regen_feedback", "feedback_text", "client_situation_hint",
+        "recent_dialogue", "last_vladimir_message_summary", "last_client_message_summary",
+        "context_summary",
     )).lower()
     # Сверяем только МНОГОЗНАЧНЫЕ числа (>=2 цифр): иначе случайная одиночная цифра
     # («5» из «5 спален» в подсказке и «5 млн» в тексте) ложно подтверждала бы цену.
@@ -4196,6 +4209,10 @@ def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str, str]
         "пиши без обращения. Саму заглушку «Имя»/«[Имя]» в ответ не переноси. "
         "Пиши только по-русски. Никогда не используй длинное тире (—) и среднее тире (–): "
         "только запятая, точка или короткий дефис. "
+        "ПРИОРИТЕТ ИСТОЧНИКОВ: (1) прямая правка/пожелание Владимира — выше всего; "
+        "(2) факты сделки (цифры, названия проектов, сроки) — ТОЛЬКО из текущей переписки; "
+        "(3) прецеденты и память стиля — это КАК отвечать (ход, структура, тон), а не факты; "
+        "(4) пак ниже — общий стиль. "
         + knowledge_directive +
         " Пиши только текст черновика ответа, без заголовков и пояснений.\n\n"
         + pack_text
