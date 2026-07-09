@@ -58,14 +58,32 @@ WIDGET_TOKEN = os.environ["WIDGET_TOKEN"]
 INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "").strip()  # для Mac assistant → Render
 SESSION_NAME = os.environ.get("SESSION_NAME", "leads_status")
 SESSION_STRING = os.environ.get("TG_SESSION_STRING", "").strip()
-STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
-LEADS_FILE = Path(os.environ.get("LEADS_FILE", "leads.json"))
+# Все файлы состояния — на постоянном диске /var/data (аудит 09.07: относительные
+# пути жили в ЭФЕМЕРНОМ каталоге контейнера и стирались при каждом деплое/рестарте.
+# Тяжелее всего били потери devices.json — реестра пуш-устройств: пуши молча
+# пропадали до суточной перерегистрации iPhone). Диск смонтирован — проверено:
+# /var/data/crm_catalog.json пережил ~10 деплоев. _prefer_disk: если на диске
+# файла ещё нет, а рядом с кодом есть старый — мигрируем содержимое один раз.
+def _prefer_disk(name: str) -> Path:
+    disk = Path("/var/data") / name
+    legacy = Path(name)
+    try:
+        disk.parent.mkdir(parents=True, exist_ok=True)
+        if not disk.exists() and legacy.exists():
+            disk.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception:
+        pass
+    return disk
+
+
+STATE_FILE = Path(os.environ.get("STATE_FILE") or _prefer_disk("state.json"))
+LEADS_FILE = Path(os.environ.get("LEADS_FILE") or _prefer_disk("leads.json"))
 LEADS_RETENTION = int(os.environ.get("LEADS_RETENTION", "200"))  # сколько лидов хранить в памяти
-TASKS_FILE = Path(os.environ.get("TASKS_FILE", "tasks_today.json"))
-INSTRUCTIONS_FILE = Path(os.environ.get("INSTRUCTIONS_FILE", "instructions.json"))
-ANTHROPIC_HEALTH_FILE = Path(os.environ.get("ANTHROPIC_HEALTH_FILE", "anthropic_health.json"))
-NEWS_FILE = Path(os.environ.get("NEWS_FILE", "news.json"))
-DEVICES_FILE = Path(os.environ.get("DEVICES_FILE", "devices.json"))
+TASKS_FILE = Path(os.environ.get("TASKS_FILE") or _prefer_disk("tasks_today.json"))
+INSTRUCTIONS_FILE = Path(os.environ.get("INSTRUCTIONS_FILE") or _prefer_disk("instructions.json"))
+ANTHROPIC_HEALTH_FILE = Path(os.environ.get("ANTHROPIC_HEALTH_FILE") or _prefer_disk("anthropic_health.json"))
+NEWS_FILE = Path(os.environ.get("NEWS_FILE") or _prefer_disk("news.json"))
+DEVICES_FILE = Path(os.environ.get("DEVICES_FILE") or _prefer_disk("devices.json"))
 SCHEDULER_HEARTBEAT_FILE = Path(os.environ.get("SCHEDULER_HEARTBEAT_FILE", "/var/data/scheduler_heartbeat.json"))
 OFFICE_TOKEN = os.environ.get("OFFICE_TOKEN", "").strip() or INTERNAL_TOKEN
 OFFICE_DRAFTS_FILE = Path(os.environ.get("OFFICE_DRAFTS_FILE", "/var/data/office_drafts.json"))
@@ -1106,6 +1124,22 @@ async def register_device(
     save_devices(devices_registry)
     log.info(f"device registered: {token[:10]}… app_version={app_version}, total={len(devices_registry)}")
     return {"status": "ok", "action": "registered", "total_devices": len(devices_registry)}
+
+
+@app.get("/api/devices/count")
+async def devices_count(authorization: Optional[str] = Header(default=None)):
+    """Диагностика пушей (аудит 09.07: не было способа снаружи узнать, есть ли
+    зарегистрированные устройства — пуш при пустом реестре пропадает молча).
+    Токены НЕ отдаём — только количество, версии и свежесть."""
+    check_token(authorization)
+    return {
+        "count": len(devices_registry),
+        "apns_configured": bool(APNS_KEY_ID and APNS_TEAM_ID and APNS_BUNDLE_ID),
+        "devices": [
+            {"app_version": d.get("app_version"), "last_seen_at": d.get("last_seen_at")}
+            for d in devices_registry
+        ],
+    }
 
 
 @app.get("/api/leads")
