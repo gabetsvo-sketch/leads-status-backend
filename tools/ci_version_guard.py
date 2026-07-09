@@ -39,9 +39,13 @@ def _version_int(raw: str) -> int:
 
 
 def _is_product_file(path: str) -> bool:
-    # Корневой .py (main.py и любые будущие корневые модули) или requirements.txt.
-    # tests/, tools/, .github/ — это подкаталоги, под шаблон не попадают.
-    return bool(re.match(r"^[^/]+\.py$", path)) or path == "requirements.txt"
+    # Корневой .py (main.py и будущие корневые модули), requirements.txt, или корневой
+    # .jsonl (память стиля style-memory-*.jsonl — движок читает её в рантайме, значит
+    # это продукт: изменение должно бампаться и деплоиться). tests/, tools/, .github/ —
+    # подкаталоги, под шаблоны не попадают.
+    return (bool(re.match(r"^[^/]+\.py$", path))
+            or path == "requirements.txt"
+            or bool(re.match(r"^[^/]+\.jsonl$", path)))
 
 
 def main() -> int:
