@@ -3032,6 +3032,28 @@ def _assert_style_payload_no_pii(payload: dict, fields: tuple[str, ...]) -> None
         _assert_style_value_no_pii(payload.get(field), field)
 
 
+def _style_sanitize_dialogue(value, limit: int = 3000) -> str:
+    """PII-safe переписка для промпта писателя: убирает почты/ссылки/@-ники и
+    телефоны, но СОХРАНЯЕТ цены, проценты и даты (писателю они нужны, чтобы точно
+    ответить). Ограничивает длину, оставляя самые свежие реплики (контракт: реплики
+    идут по порядку, свежие снизу). Основную чистку делает воркер — это защитный слой.
+    Не asserts/не 400: движок не должен падать из-за формата переписки."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[почта]", s)
+    s = re.sub(r"(?:https?://|t\.me/|wa\.me/|instagram\.com/)\S+", "[ссылка]", s, flags=re.I)
+    s = re.sub(r"@[A-Za-z0-9_]{3,}", "[ник]", s)
+    # Телефоны: междунар. с «+» или 10-11 слитных цифр. Цены с пробелами (12 500 000)
+    # не трогаем — в них нет «+» и цифры разделены пробелами.
+    s = re.sub(r"\+\d[\d()\-\s]{7,}\d", "[телефон]", s)
+    s = re.sub(r"(?<!\d)[789]\d{9,10}(?!\d)", "[телефон]", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    if len(s) > limit:
+        s = "…" + s[-limit:]
+    return s
+
+
 def _style_meaning_says_not_actual(*values) -> bool:
     text = " ".join(str(v or "") for v in values).lower()
     return any(marker in text for marker in _STYLE_NOT_ACTUAL_MARKERS)
@@ -3389,6 +3411,25 @@ def _style_choose_pack(payload: dict) -> tuple[str, list[str], str]:
         "client_situation_hint", "last_client_message_summary", "deal_stage", "client_last_message_type",
     )).lower()
     stage = str(payload.get("deal_stage") or "").lower()
+
+    # Очень долгая пауза (месяц+) важнее темы: сначала возобновить контакт, тема вторична
+    # (жалоба Владимира «не учитывается пауза», аудит 2026-07-09). Порог высокий и
+    # консервативный — короткие/средние паузы учитываются писателем через промпт, но
+    # тематический pack не теряется.
+    try:
+        _sil = float(payload.get("silence_days") or 0)
+    except (TypeError, ValueError):
+        _sil = 0.0
+    if _sil >= 30:
+        _topic = "client_asks_question"
+        if any(k in text for k in ("цена", "price", "roi", "доход", "стоимост", "бюджет")):
+            _topic = "price_roi_explanation"
+        elif any(k in text for k in ("подбор", "подборк", "вариант")):
+            _topic = "object_selection_explainer"
+        elif any(k in text for k in ("оплат", "рассроч", "документ", "договор")):
+            _topic = "payment_and_documents_explanation"
+        return ("long_silence_reactivation", [_topic, "followup_after_silence"],
+                f"Долгая пауза {int(_sil)} дн.: сначала возобновление контакта, тема ({_topic}) вторична.")
 
     # Рискованные сценарии (деньги/юридика/оплата) — первыми: у них жёсткий safety gate.
     if any(k in text for k in ("цена", "price", "roi", "доход", "стоимост", "бюджет")) or re.search(r"\bокуп", text):
@@ -3922,12 +3963,40 @@ def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str, str]
         else "Конкретные цифры — только из подтверждённого источника, без выдумок."
     )
     parts = []
+    # ГЛАВНЫЙ контекст — реальная переписка (последние реплики). Раньше писатель видел
+    # только сводку ≤300 символов и отвечал «на сводку», а не на реальный вопрос клиента.
+    recent_dialogue = _style_sanitize_dialogue(payload.get("recent_dialogue"))
+    if recent_dialogue:
+        parts.append(
+            "ПЕРЕПИСКА С КЛИЕНТОМ (последние сообщения — отвечай именно на них, "
+            "на последнюю реплику клиента; не повторяй то, что уже отправлял):\n"
+            + recent_dialogue
+        )
     if payload.get("last_client_message_summary"):
-        parts.append(f"Последнее сообщение клиента: {payload['last_client_message_summary']}")
-    if payload.get("last_vladimir_message_summary"):
+        # Когда есть реальная переписка — это лишь сводка ситуации, а не «последнее сообщение».
+        label = "Сводка ситуации по сделке" if recent_dialogue else "Последнее сообщение клиента"
+        parts.append(f"{label}: {payload['last_client_message_summary']}")
+    if payload.get("last_vladimir_message_summary") and not recent_dialogue:
         parts.append(f"Последнее сообщение Владимира: {payload['last_vladimir_message_summary']}")
-    if payload.get("silence_days"):
-        parts.append(f"Клиент молчал {payload['silence_days']} дней.")
+    # Пауза между сообщениями — критично для тона (прямая жалоба Владимира). Нельзя
+    # писать так, будто разговор был вчера, если клиент давно молчит.
+    try:
+        _sil = int(float(payload.get("silence_days") or 0))
+    except (TypeError, ValueError):
+        _sil = 0
+    if _sil >= 21:
+        parts.append(
+            f"ВАЖНО ПРО ПАУЗУ: клиент молчит уже {_sil} дней (долгая пауза). Начни с "
+            "уместного ненавязчивого возобновления контакта — НЕ продолжай так, будто "
+            "беседа была вчера, и НЕ повторяй то, что уже отправлял. Без давления."
+        )
+    elif _sil >= 5:
+        parts.append(
+            f"Клиент молчит {_sil} дней — учти паузу: мягко напомни о себе, не продолжай "
+            "так, будто разговор не прерывался."
+        )
+    elif _sil >= 1:
+        parts.append(f"Клиент молчит {_sil} дней.")
     if payload.get("deal_stage"):
         parts.append(f"Стадия: {payload['deal_stage']}.")
     if payload.get("client_situation_hint"):
@@ -4045,7 +4114,7 @@ async def _style_write_draft_claude(payload: dict, pack_id: str, pack_text: str)
         })
     resp = await cli.messages.create(
         model=STYLE_WRITER_MODEL,
-        max_tokens=350,
+        max_tokens=700,  # 350 обрезало длинные (3-5 предложений) черновики; длину держит промпт
         thinking={"type": "disabled"},
         output_config={"effort": "low"},
         system=system_blocks,
