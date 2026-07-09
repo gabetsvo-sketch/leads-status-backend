@@ -3952,14 +3952,34 @@ def _style_normalize_card_fields(t: dict) -> dict:
 # --------------------------------------------------------------------------------
 
 
-def _style_fetch_similar_sync(situation: str, scenario: str, k: int = 3) -> dict:
+def _style_rag_query(payload: dict) -> str:
+    """Запрос к базе прецедентов = ТЕКУЩИЙ МОМЕНТ: последняя реплика клиента из переписки
+    (а не сводка всей сделки — иначе матчатся общие письма, находка аудита 2026-07-09).
+    Фолбэк — сводка/подсказка, если реплик нет."""
+    rd = str(payload.get("recent_dialogue") or "")
+    for ln in reversed(rd.splitlines()):
+        m = re.match(r"\[.+?\]\s*клиент\s*:\s*(.+)", ln.strip())
+        if m and len(m.group(1).strip()) >= 3:
+            return m.group(1).strip()[:500]
+    q = str(
+        payload.get("last_client_message_summary")
+        or payload.get("client_situation_hint")
+        or payload.get("context_summary") or ""
+    ).strip()
+    return q[:500]
+
+
+def _style_fetch_similar_sync(situation: str, scenario: str, k: int = 3, pause_days=None) -> dict:
     """Поиск похожих ситуаций в индексе прошлых диалогов (Mac, тот же ngrok-туннель,
     что и паки). Локальный bge-m3 на Mac → 0 токенов. При недоступности — пусто."""
     base = (STYLE_RUNTIME_HTTP_BASE_URL or "").rstrip("/")
     if not base or not (situation or "").strip():
         return {"results": []}
     import urllib.request as _req
-    body = json.dumps({"situation": situation, "scenario": scenario, "k": k}).encode("utf-8")
+    q_body = {"situation": situation, "scenario": scenario, "k": k}
+    if pause_days is not None:
+        q_body["pause_days"] = pause_days
+    body = json.dumps(q_body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if STYLE_RUNTIME_HTTP_TOKEN:
         headers["X-Style-Token"] = STYLE_RUNTIME_HTTP_TOKEN
@@ -4106,21 +4126,35 @@ def _style_writer_prompts(payload: dict, pack_text: str) -> tuple[str, str, str]
         "\n".join(parts)
         + f"\n\nКанал: {channel}. Длина: {length_note}. {price_note}"
     )
-    # Похожие ситуации из прошлых диалогов Владимира (RAG): writer пишет заново,
-    # держась примера, но факты текущей сделки приоритетнее (решение Владимира).
-    similar = payload.get("similar_examples") or []
-    similar = [str(s).strip() for s in similar if str(s).strip()][:3]
-    if similar:
-        examples_block = "\n".join(f"- «{s}»" for s in similar)
-        user_content += (
-            "\n\nПОХОЖИЕ СИТУАЦИИ ИЗ ПРОШЛЫХ ДИАЛОГОВ ВЛАДИМИРА (как он отвечал в близких случаях):\n"
-            f"{examples_block}\n"
-            "Из примеров бери ТОЛЬКО тон, структуру и заходы. НЕ переноси из примеров конкретику: "
-            "цифры (цены, проценты, суммы, сроки), названия проектов и факты - они из ДРУГИХ сделок "
-            "и к текущему клиенту могут не относиться. Конкретные цифры/факты - только если они "
-            "подтверждены в текущей сделке. Если контекст не позволяет повторить ход примера - "
-            "опирайся на общий стиль."
+    # Прецеденты из прошлых диалогов Владимира (RAG): пары «ситуация клиента → ответ
+    # Владимира». Писатель перенимает ХОД самого близкого прецедента, а не только тон.
+    _facts_note = (
+        "НО конкретику (цифры: цены/проценты/суммы/сроки, названия проектов, факты) бери "
+        "ТОЛЬКО из текущей переписки — прецеденты из ДРУГИХ сделок, их факты могут не подходить. "
+        "Если ход прецедента не ложится на текущий контекст — опирайся на общий стиль."
+    )
+    pairs = payload.get("similar_pairs") or []
+    pairs = [p for p in pairs if isinstance(p, dict) and str(p.get("reply") or "").strip()][:5]
+    if pairs:
+        block = "\n".join(
+            f"- Клиент: «{str(p.get('situation') or '').strip()}» → Владимир ответил: «{str(p.get('reply')).strip()}»"
+            for p in pairs
         )
+        user_content += (
+            "\n\nПРЕЦЕДЕНТЫ — как Владимир отвечал в ПОХОЖИХ ситуациях (ситуация клиента → его ответ):\n"
+            f"{block}\n"
+            "Это реальные прецеденты. Возьми ХОД, структуру и тон из самого близкого к текущей "
+            f"ситуации — как Владимир реально поступает в таком случае. {_facts_note}"
+        )
+    else:
+        similar = payload.get("similar_examples") or []
+        similar = [str(s).strip() for s in similar if str(s).strip()][:3]
+        if similar:
+            examples_block = "\n".join(f"- «{s}»" for s in similar)
+            user_content += (
+                "\n\nПОХОЖИЕ ОТВЕТЫ ВЛАДИМИРА В БЛИЗКИХ СЛУЧАЯХ (перенимай ход и тон):\n"
+                f"{examples_block}\n{_facts_note}"
+            )
     if feedback:
         user_content += (
             "\n\n!!! ГЛАВНОЕ ТРЕБОВАНИЕ. Владимир прочитал прошлый черновик и просит "
@@ -4321,16 +4355,22 @@ async def style_runtime_draft(
     # (scenario), смыслу, свежести, повторам. Локально на Mac → 0 токенов на поиск.
     style_source = None
     if not payload.get("similar_examples"):
-        situation_q = str(
-            payload.get("last_client_message_summary")
-            or payload.get("client_situation_hint")
-            or payload.get("context_summary") or ""
-        ).strip()
+        situation_q = _style_rag_query(payload)
         if situation_q:
-            sim = await asyncio.to_thread(_style_fetch_similar_sync, situation_q, pack_id, 3)
+            try:
+                _pd = int(float(payload.get("silence_days") or 0)) or None
+            except (TypeError, ValueError):
+                _pd = None
+            sim = await asyncio.to_thread(_style_fetch_similar_sync, situation_q, pack_id, 5, _pd)
             results = sim.get("results") or []
             if results:
                 payload["similar_examples"] = [r.get("reply") for r in results if r.get("reply")]
+                # Пары «ситуация→ответ» — прецеденты (писатель перенимает ХОД, не только тон).
+                payload["similar_pairs"] = [
+                    {"situation": _style_sanitize_dialogue(r.get("situation"), 300),
+                     "reply": _style_sanitize_dialogue(r.get("reply"), 500)}
+                    for r in results if r.get("reply")
+                ][:5]
                 top = results[0]
                 style_source = {
                     "date": top.get("date") or "",
