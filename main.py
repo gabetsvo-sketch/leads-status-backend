@@ -1508,6 +1508,28 @@ async def internal_tasks_priority(
     return {"status": "ok", "updated": updated}
 
 
+# Возраст последнего успешного чтения CRM, после которого канал считается
+# мёртвым (заявки/задачи перестали обновляться). 30 минут: newleads тикает
+# каждые 60с — полчаса без единого успеха это авария, а не сетевая икота.
+CRM_STALE_SEC = int(os.environ.get("CRM_STALE_SEC", "1800"))
+# Аварийный пуш о падении канала — не чаще раза в 4 часа (не спамить).
+CRM_ALERT_COOLDOWN_SEC = int(os.environ.get("CRM_ALERT_COOLDOWN_SEC", "14400"))
+
+
+def _crm_ok_from(crm: dict):
+    """True/False по данным пульса; None — воркер здоровье не прислал (старый)."""
+    if not crm:
+        return None
+    if crm.get("cdp_ok") is False:
+        return False
+    if crm.get("auth_ok") is False:
+        return False
+    age = crm.get("lead_sync_age_sec")
+    if isinstance(age, (int, float)) and age > CRM_STALE_SEC:
+        return False
+    return True
+
+
 @app.post("/api/internal/heartbeat")
 async def scheduler_heartbeat(
     payload: dict = Body(default={}),
@@ -1515,16 +1537,59 @@ async def scheduler_heartbeat(
 ):
     """Этап 1.1: Mac scheduler пишет heartbeat каждые 30 сек.
     iOS GET /api/health/scheduler определяет online/offline по этому ts.
+    С 09.07 (урок 12-дневного молчаливого простоя CDP): пульс несёт блок `crm`
+    (cdp_ok/auth_ok/возраст последнего чтения) — по нему красится точка в iOS,
+    а при переходе канала в down уходит ОДИН аварийный пуш Владимиру.
     """
     check_internal(authorization)
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
     workers = payload.get("workers") or []
+    crm = payload.get("crm") or {}
+    crm_ok = _crm_ok_from(crm)
+
+    prev = {}
+    try:
+        prev = json.loads(SCHEDULER_HEARTBEAT_FILE.read_text())
+    except Exception:
+        pass
+    prev_crm_ok = prev.get("crm_ok")
+    last_alert_ts = float(prev.get("crm_alert_ts") or 0)
+    alert_ts = last_alert_ts
+
+    if crm_ok is False and prev_crm_ok is not False:
+        # канал только что упал → один пуш (с кулдауном против дребезга)
+        if now_dt.timestamp() - last_alert_ts > CRM_ALERT_COOLDOWN_SEC:
+            reason = ("нужно войти в amoCRM" if crm.get("auth_ok") is False
+                      else "браузер CRM не отвечает" if crm.get("cdp_ok") is False
+                      else "данные не обновляются")
+            try:
+                sent = await send_push_to_all(
+                    title="⚠️ Заявки из CRM не обновляются",
+                    body=f"Канал к amoCRM упал: {reason}. Приложение показывает старые данные.",
+                )
+                log.warning(f"heartbeat: CRM-канал упал ({reason}), алерт-пуш → {sent} устройств")
+            except Exception as e:
+                log.error(f"heartbeat: алерт-пуш не ушёл: {e}")
+            alert_ts = now_dt.timestamp()
+    elif crm_ok is True and prev_crm_ok is False:
+        try:
+            await send_push_to_all(
+                title="✅ Канал CRM восстановлен",
+                body="Заявки и задачи снова обновляются.",
+            )
+        except Exception as e:
+            log.error(f"heartbeat: пуш о восстановлении не ушёл: {e}")
+
     SCHEDULER_HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
     SCHEDULER_HEARTBEAT_FILE.write_text(json.dumps({
         "last_seen": now,
         "pid": payload.get("pid"),
         "workers_count": len(workers),
         "workers": workers,
+        "crm": crm,
+        "crm_ok": crm_ok,
+        "crm_alert_ts": alert_ts,
     }, ensure_ascii=False))
     return {"status": "ok"}
 
@@ -1535,26 +1600,35 @@ async def get_scheduler_health(
 ):
     """Этап 1.1: iOS опрашивает чтобы показать зелёную/красную точку
     «Mac jobs: live/offline» рядом со статус-баннером.
-    online = heartbeat был < 90 сек назад."""
+    online = heartbeat был < 90 сек назад.
+    crm_ok (с 09.07) = канал к amoCRM реально читает данные: true/false/null
+    (null — воркер ещё не шлёт здоровье). iOS: точка зелёная ТОЛЬКО при
+    online && crm_ok != false; при crm_ok=false — жёлтая/красная с причиной."""
     check_token(authorization)
     if not SCHEDULER_HEARTBEAT_FILE.exists():
-        return {"online": False, "last_seen": None, "workers_count": 0}
+        return {"online": False, "last_seen": None, "workers_count": 0, "crm_ok": None}
     try:
         data = json.loads(SCHEDULER_HEARTBEAT_FILE.read_text())
         last_seen_iso = data.get("last_seen")
         if not last_seen_iso:
-            return {"online": False, "last_seen": None, "workers_count": 0}
+            return {"online": False, "last_seen": None, "workers_count": 0, "crm_ok": None}
         last_seen = datetime.fromisoformat(last_seen_iso.replace("Z", "+00:00"))
         age_sec = (datetime.now(timezone.utc) - last_seen).total_seconds()
+        crm = data.get("crm") or {}
         return {
             "online": age_sec < 90,
             "last_seen": last_seen_iso,
             "workers_count": data.get("workers_count", 0),
             "age_sec": int(age_sec),
+            "crm_ok": data.get("crm_ok"),
+            "crm_auth_ok": crm.get("auth_ok"),
+            "crm_cdp_ok": crm.get("cdp_ok"),
+            "lead_sync_age_sec": crm.get("lead_sync_age_sec"),
+            "task_sync_age_sec": crm.get("task_sync_age_sec"),
         }
     except Exception as e:
         log.error(f"scheduler_health: {e}")
-        return {"online": False, "last_seen": None, "workers_count": 0}
+        return {"online": False, "last_seen": None, "workers_count": 0, "crm_ok": None}
 
 
 @app.post("/api/internal/leads/{lead_id}/silent_ack")
