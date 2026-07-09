@@ -3632,7 +3632,19 @@ def _style_select_memory_records(payload: dict, pack_id: str, limit: int = 16) -
             guards.append(record)
         elif record_type in _STYLE_MEMORY_EXAMPLE_TYPES:
             examples.append(record)
-    return {"examples": examples[:limit], "guards": guards[:limit]}
+
+    # Глобальные approved-правила (стиль Владимира, без pack) — В ПРИОРИТЕТЕ: это его
+    # кросс-сценарные уроки, должны доходить до писателя, а не вытесняться сценарными
+    # записями при лимите. Раньше новые одобренные правила (в конце файла) обрезались
+    # (аудит 07-09). Порядок: сначала все глобальные, затем сценарные до добора.
+    def _is_global(r):
+        return not (r.get("pack_id") or r.get("bucket"))
+    g_ex = [r for r in examples if _is_global(r)]
+    p_ex = [r for r in examples if not _is_global(r)]
+    selected_ex = (g_ex[:limit] + p_ex[:8])[: limit + 8]
+    g_gu = [r for r in guards if _is_global(r)]
+    p_gu = [r for r in guards if not _is_global(r)]
+    return {"examples": selected_ex, "guards": (g_gu + p_gu)[:limit]}
 
 
 def _style_format_memory_for_prompt(memory: dict) -> str:

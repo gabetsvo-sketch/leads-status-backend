@@ -57,3 +57,14 @@ def test_distilled_rules_loaded(app_client):
     ids = {r.get("id") for r in main._style_load_approved_memory_records()}
     for rid in ("sm_vlad_fb_011", "sm_vlad_fb_012", "sm_vlad_fb_013", "sm_vlad_fb_014"):
         assert rid in ids, f"{rid} должно быть загружено как approved"
+
+
+def test_global_rules_prioritized_over_pack(app_client):
+    client, main = app_client
+    # даже для пака со своими записями глобальные правила (sm_vlad_fb_*/sm_batchb_*)
+    # должны попадать в выдачу, а не вытесняться сценарными при лимите.
+    mem = main._style_select_memory_records(
+        {"channel": "whatsapp", "deal_stage": "active"}, "initial_contact_after_lead")
+    ex_ids = [r.get("id") for r in mem.get("examples", [])]
+    globals_in = [i for i in ex_ids if str(i).startswith(("sm_vlad_fb", "sm_batchb"))]
+    assert globals_in, "глобальные approved-правила должны быть в выдаче памяти"
