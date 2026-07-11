@@ -993,6 +993,18 @@ async def internal_lead(
                 if v not in (None, "", []) and L.get(k) in (None, "", []):
                     L[k] = v
                     updated = True
+            # Этап 4 аудита (09.07): поля для полной карточки заявки.
+            # Эти обновляются ВСЕГДА при непустом новом значении (этап сделки
+            # меняется, контекст переписки дообогащается enrich-воркером).
+            for k in ("pipeline_id", "status_id", "context_summary", "rationale"):
+                v = payload.get(k)
+                if v not in (None, "", []) and v != L.get(k):
+                    L[k] = v
+                    updated = True
+            if "has_correspondence" in payload:
+                if bool(payload["has_correspondence"]) != L.get("has_correspondence"):
+                    L["has_correspondence"] = bool(payload["has_correspondence"])
+                    updated = True
             # Также если scheduler сгенерил свежий start_message, а timer_3min_text
             # пуст или auto-fallback — обновим. Если Vladimir уже видел свой
             # текст (любой непустой), не трогаем.
@@ -1041,6 +1053,14 @@ async def internal_lead(
         "preferred_channel": payload.get("preferred_channel", ""),  # "telegram"|"whatsapp"|""
         "request_text": payload.get("request_text", ""),  # что клиент написал в первичной заявке
         "custom_fields": payload.get("custom_fields") or [],  # все поля из AmoCRM как [{name,value}]
+        # Этап 4 аудита (09.07): полная карточка заявки — этап сделки CRM
+        # (для выпадающего списка статусов) + контекст переписки (enrich-воркер).
+        "pipeline_id": payload.get("pipeline_id"),
+        "status_id": payload.get("status_id"),
+        "context_summary": payload.get("context_summary", ""),
+        "whatsapp_phone": payload.get("whatsapp_phone", ""),
+        "telegram_id": payload.get("telegram_id", ""),
+        "messengers": payload.get("messengers") or [],
     }
     # Build 26: scheduler передал стартовое сообщение (Claude + playbook/wiki).
     # Используем его вместо fallback простого prompt в timer_loop — сообщение
@@ -1383,6 +1403,27 @@ async def post_crm_action(payload: dict = Body(...), authorization: Optional[str
     _save_crm_actions(items)
     log.info(f"crm_action {aid}: {action} task#{crm_task_id} due={due or '-'}")
     return {"status": "ok", "id": aid}
+
+
+@app.get("/api/crm_actions/{action_id}")
+async def get_crm_action(action_id: str, authorization: Optional[str] = Header(default=None)):
+    """Этап 3 аудита (09.07): iOS опрашивает РЕАЛЬНЫЙ статус исполнения действия
+    в CRM (pending → applied/failed). Раньше кнопки «Выполнить»/«Поменять дату»/
+    «Этап сделки» показывали успех в момент постановки в очередь — при мёртвом
+    CRM-канале Владимир видел галочку, а в amoCRM ничего не менялось."""
+    check_token(authorization)
+    for a in _load_crm_actions():
+        if a.get("id") == action_id:
+            return {
+                "id": a.get("id"),
+                "status": a.get("status"),
+                "action": a.get("action"),
+                "label": a.get("label"),
+                "result": a.get("result"),
+                "created_at": a.get("created_at"),
+                "done_at": a.get("done_at"),
+            }
+    raise HTTPException(status_code=404, detail="action not found")
 
 
 @app.get("/api/internal/crm_actions")
