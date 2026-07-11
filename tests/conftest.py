@@ -50,6 +50,7 @@ def _set_test_env(tmp_path: Path) -> None:
     os.environ["SENT_EVENTS_FILE"] = str(tmp_path / "sent_events.jsonl")
     os.environ["RECLASSIFY_REQUEST_FILE"] = str(tmp_path / "reclassify_request.json")
     os.environ["SYNC_NOW_REQUEST_FILE"] = str(tmp_path / "sync_now_request.json")
+    os.environ["AUTO_STYLE_RULES_FILE"] = str(tmp_path / "style_auto_rules.jsonl")
 
 
 @pytest.fixture

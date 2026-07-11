@@ -105,6 +105,10 @@ STYLE_RUNTIME_FEEDBACK_FILE = Path(os.environ.get("STYLE_RUNTIME_FEEDBACK_FILE",
 SENT_EVENTS_FILE = Path(os.environ.get("SENT_EVENTS_FILE", "/var/data/sent_events.jsonl"))
 STYLE_RUNTIME_HTTP_BASE_URL = os.environ.get("STYLE_RUNTIME_HTTP_BASE_URL", "").strip().rstrip("/")
 STYLE_RUNTIME_HTTP_TOKEN = os.environ.get("STYLE_RUNTIME_HTTP_TOKEN", "").strip()
+# Авто-выученные правила стиля (решение Владимира 11.07): Mac-учитель вносит
+# сюда правила, повторившиеся у ≥3 разных клиентов. На постоянном диске.
+AUTO_STYLE_RULES_FILE = Path(os.environ.get("AUTO_STYLE_RULES_FILE", "/var/data/style_auto_rules.jsonl"))
+AUTO_STYLE_RULES_CAP = int(os.environ.get("AUTO_STYLE_RULES_CAP", "15"))
 STYLE_MEMORY_FILE = Path(os.environ.get(
     "STYLE_MEMORY_FILE",
     str(STYLE_RUNTIME_DIR / "style-memory-v1-approved-batch-a.jsonl"),
@@ -1486,6 +1490,89 @@ def _load_memos() -> dict:
         return json.loads(KNOWLEDGE_MEMOS_FILE.read_text()).get("memos") or {}
     except Exception:
         return {}
+
+
+@app.post("/api/internal/style/auto_rules")
+async def post_style_auto_rules(payload: dict = Body(...), authorization: Optional[str] = Header(default=None)):
+    """Авто-обучение стиля (решение Владимира 11.07): Mac-учитель присылает ПОЛНЫЙ
+    актуальный набор авто-правил (идемпотентная замена — так учитель управляет и
+    удалением). Валидация, cap, пуш Владимиру о каждом НОВОМ правиле (≤3 за раз)."""
+    check_internal(authorization)
+    rules = payload.get("rules")
+    if not isinstance(rules, list):
+        raise HTTPException(status_code=400, detail="rules must be a list")
+    cleaned = []
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        rid = str(r.get("id") or "").strip()
+        text = str(r.get("text") or "").strip()
+        if not rid.startswith("sm_auto_") or not text or len(text) > 400:
+            continue
+        rtype = r.get("type") if r.get("type") in ("style_feature", "contraindication") else "style_feature"
+        cleaned.append({
+            "schema_version": "style_memory_v1",
+            "id": rid,
+            "type": rtype,
+            "text": text,
+            "stage": r.get("stage") or ["any"],
+            "channel": r.get("channel") or ["any"],
+            "confidence": "approved_auto",
+            "runtime_status": "loaded",
+            "source": str(r.get("source") or "auto_teacher"),
+            "evidence_leads": r.get("evidence_leads") or [],
+            "created_at": str(r.get("created_at") or datetime.now(timezone.utc).isoformat()),
+        })
+    cleaned = cleaned[:AUTO_STYLE_RULES_CAP]
+
+    prev_ids: set = set()
+    try:
+        if AUTO_STYLE_RULES_FILE.exists():
+            for line in AUTO_STYLE_RULES_FILE.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    prev_ids.add(json.loads(line).get("id"))
+    except Exception:
+        pass
+
+    AUTO_STYLE_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTO_STYLE_RULES_FILE.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in cleaned) + ("\n" if cleaned else ""),
+        encoding="utf-8")
+
+    new_rules = [r for r in cleaned if r["id"] not in prev_ids]
+    for r in new_rules[:3]:
+        try:
+            await send_push_to_all(
+                title="🎓 Движок стиля выучил правило",
+                body=r["text"][:170],
+            )
+        except Exception as e:
+            log.error(f"auto_rules: пуш о правиле не ушёл: {e}")
+    if len(new_rules) > 3:
+        try:
+            await send_push_to_all(
+                title="🎓 Движок стиля",
+                body=f"Выучено ещё {len(new_rules) - 3} правил — полный список в приложении.",
+            )
+        except Exception:
+            pass
+    log.info(f"style auto_rules: принято {len(cleaned)} (новых {len(new_rules)})")
+    return {"status": "ok", "count": len(cleaned), "new": len(new_rules)}
+
+
+@app.get("/api/style/auto_rules")
+async def get_style_auto_rules(authorization: Optional[str] = Header(default=None)):
+    """Прозрачность авто-обучения: полный список действующих авто-правил."""
+    check_token(authorization)
+    rules = []
+    try:
+        if AUTO_STYLE_RULES_FILE.exists():
+            for line in AUTO_STYLE_RULES_FILE.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    rules.append(json.loads(line))
+    except Exception:
+        pass
+    return {"count": len(rules), "rules": rules}
 
 
 @app.post("/api/internal/knowledge/memos")
@@ -3665,24 +3752,45 @@ def _style_load_approved_memory_records() -> list[dict]:
             path = candidate
             break
     else:
-        return []
+        path = None
     records: list[dict] = []
+    if path is not None:
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    continue
+                if record.get("confidence") != "approved":
+                    continue
+                if not record.get("id") or not record.get("text"):
+                    continue
+                records.append(record)
+        except Exception:
+            log.warning("style_memory: failed to parse approved memory at %s", path, exc_info=True)
+            records = []
+    # Авто-выученные правила (решение Владимира 11.07: система сама переводит
+    # повторяющиеся у РАЗНЫХ клиентов правки в общие правила — без ручного
+    # одобрения каждой пачки). Пишет Mac-учитель через /api/internal/style/auto_rules;
+    # confidence="approved_auto", участвуют наравне с одобренными.
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                continue
-            if record.get("confidence") != "approved":
-                continue
-            if not record.get("id") or not record.get("text"):
-                continue
-            records.append(record)
+        if AUTO_STYLE_RULES_FILE.exists():
+            for line in AUTO_STYLE_RULES_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    continue
+                if record.get("confidence") not in ("approved_auto", "approved"):
+                    continue
+                if not record.get("id") or not record.get("text"):
+                    continue
+                records.append(record)
     except Exception:
-        log.warning("style_memory: failed to parse approved memory at %s", path, exc_info=True)
-        return []
+        log.warning("style_memory: failed to parse auto rules", exc_info=True)
     return records
 
 
