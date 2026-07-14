@@ -1492,6 +1492,23 @@ def _load_memos() -> dict:
         return {}
 
 
+@app.post("/api/internal/alert_push")
+async def internal_alert_push(payload: dict = Body(...), authorization: Optional[str] = Header(default=None)):
+    """Служебный алерт-пуш Владимиру от Mac-воркеров (11.07: отправитель отложенных
+    сообщает «нужен вход в WhatsApp/Telegram Web»). Кулдаун — на стороне воркера."""
+    check_internal(authorization)
+    title = str(payload.get("title") or "").strip()[:100]
+    body_text = str(payload.get("body") or "").strip()[:200]
+    if not title or not body_text:
+        raise HTTPException(status_code=400, detail="title and body required")
+    try:
+        sent = await send_push_to_all(title=title, body=body_text)
+    except Exception as e:
+        log.error(f"alert_push: {e}")
+        sent = 0
+    return {"status": "ok", "sent": sent}
+
+
 @app.post("/api/internal/style/auto_rules")
 async def post_style_auto_rules(payload: dict = Body(...), authorization: Optional[str] = Header(default=None)):
     """Авто-обучение стиля (решение Владимира 11.07): Mac-учитель присылает ПОЛНЫЙ
@@ -2490,6 +2507,24 @@ async def task_sent(
 
     save_tasks(tasks_today)
     log.info(f"task#{task_id}: send {pend.get('status')} (analysis={'+' if edit_analysis else '-'}, prior={prior_status}, awaiting_reply={success})")
+
+    # Отложенная отправка (11.07): Владимир задал текст и время из приложения —
+    # о ФАКТЕ отправки (или провале) он узнаёт пушем, не заглядывая в карточку.
+    if (payload.get("source") or "") == "scheduled":
+        name = target.get("lead_name") or f"задача #{task_id}"
+        ch = "Telegram" if (payload.get("channel") or pend.get("channel")) == "telegram" else "WhatsApp"
+        try:
+            if success:
+                await send_push_to_all(
+                    title="✓ Отложенное сообщение отправлено",
+                    body=f"{name} · {ch} — ушло по расписанию.")
+            else:
+                await send_push_to_all(
+                    title="⚠️ Отложенная отправка не ушла",
+                    body=f"{name} · {ch}: {error or 'ошибка'} — откройте карточку.")
+        except Exception as e:
+            log.error(f"task_sent: пуш о scheduled-отправке не ушёл: {e}")
+
     return {"status": "ok", "task_id": task_id}
 
 
